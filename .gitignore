@@ -1,5 +1,6 @@
-# Secret credentials — never commit!
+# Secret credentials & runtime data — never commit!
 .env
+user_data.json
 
 # Python cache
 __pycache__/

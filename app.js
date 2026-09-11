@@ -450,6 +450,7 @@ async function handleSend(e) {
       return;
     }
     state.goalHours = hours;
+    try { localStorage.setItem('workbot_saved_goal', String(hours)); } catch(e) {}
     document.getElementById('btn6h').classList.toggle('active', hours === 6);
     document.getElementById('btn8h').classList.toggle('active', hours === 8);
     await botSay(`✅ Goal set to <strong>${hours} hour${hours !== 1 ? 's' : ''}</strong>!`, 400);
@@ -518,6 +519,7 @@ async function quickSelect(val) {
   if (state.step !== 'askGoal' && state.step !== 'customGoal') return;
 
   state.goalHours = val;
+  try { localStorage.setItem('workbot_saved_goal', String(val)); } catch(e) {}
   document.getElementById('btn6h').classList.toggle('active', val === 6);
   document.getElementById('btn8h').classList.toggle('active', val === 8);
   await addMessage('user', `${val} hour goal`);

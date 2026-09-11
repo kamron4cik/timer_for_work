@@ -45,6 +45,7 @@ python3 bot.py
 | `/status` | Show progress + timeline |
 | `/done` | End session + final summary |
 | `/reset` | Clear & start over |
+| `/report` | Weekly & monthly work reports |
 
 All commands are also available as **inline buttons** — no typing needed!
 
@@ -57,8 +58,18 @@ Every pause and resume is logged as a separate entry. The `/status` command show
 ```
 💼 Work   09:00 → 10:30  (1h 30m)
 ☕ Break  10:30 → 11:00  (30m)
-💼 Work   11:00 → 13:00  (2h 00m)  ← now
+💼 Work   11:00 → 13:00  (2h 00m)
+🍱 Break  13:00 → 14:00  (1h 00m)  (Lunch Break)
+💼 Work   14:00 → 16:30  (2h 30m)  ← now
 ```
+
+---
+
+## 🍱 Automatic Lunch Break (13:00 – 14:00)
+- The bot automatically pauses the timer at **13:00** for lunch break and notifies you.
+- At **14:00**, it automatically resumes your work timer.
+- If you work through lunch, a **▶️ Work Anyway** button lets you override the pause anytime.
+- Custom daily goals (e.g. 4 hours) are permanently saved and preserved even when resetting the day.
 
 ---
 
