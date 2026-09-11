@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkBot — Daily Hours Tracker</title>
+  <meta name="description" content="A smart daily working hours calculator bot. Track your start time, breaks, and get precise work duration insights." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-orbs">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+  </div>
+
+  <main class="app">
+    <header class="app-header">
+      <div class="bot-avatar">
+        <span class="bot-icon">🤖</span>
+        <span class="bot-status"></span>
+      </div>
+      <div class="header-info">
+        <h1>WorkBot</h1>
+        <p>Your daily hours assistant</p>
+      </div>
+      <div class="live-clock" id="liveClock"></div>
+    </header>
+
+    <section class="chat-window" id="chatWindow" aria-live="polite" aria-label="Chat with WorkBot"></section>
+
+    <div class="progress-section" id="progressSection" style="display:none">
+      <div class="progress-header">
+        <span class="progress-label">Daily Goal Progress</span>
+        <span class="progress-pct" id="progressPct">0%</span>
+      </div>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-stats">
+        <span id="workedStat">Worked: 0h 0m</span>
+        <span id="remainStat">Remaining: —</span>
+        <span id="goalStat">Goal: —</span>
+      </div>
+    </div>
+
+    <div class="input-panel">
+      <div class="quick-actions" id="quickActions">
+        <button class="quick-btn" id="btn6h" onclick="quickSelect(6)">6h Goal</button>
+        <button class="quick-btn" id="btn8h" onclick="quickSelect(8)">8h Goal</button>
+        <button class="quick-btn" onclick="quickSelect('custom')">Custom</button>
+        <button class="quick-btn accent" onclick="resetAll()">Reset</button>
+      </div>
+      <form class="input-row" id="inputForm" onsubmit="handleSend(event)">
+        <input
+          type="text"
+          id="userInput"
+          class="chat-input"
+          placeholder="Type a time (e.g. 09:00) or a message…"
+          autocomplete="off"
+          aria-label="Your message"
+        />
+        <button type="submit" class="send-btn" id="sendBtn" aria-label="Send">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
+      </form>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
