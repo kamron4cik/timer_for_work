@@ -7,6 +7,31 @@ const state = {
   liveInterval: null,
 };
 
+// ===== STORAGE =====
+function getDateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getHistory() {
+  try { return JSON.parse(localStorage.getItem('workbot_history') || '{}'); }
+  catch { return {}; }
+}
+
+function saveDay() {
+  if (!state.startTime || !state.goalHours) return;
+  const r = calcResult();
+  const key = getDateKey(state.startTime);
+  const history = getHistory();
+  history[key] = {
+    goalHours: state.goalHours,
+    workedMinutes: r.worked,
+    breakMinutes: state.breakMinutes,
+    startTime: fmtTime(state.startTime),
+    pct: Math.min(110, r.pct)
+  };
+  localStorage.setItem('workbot_history', JSON.stringify(history));
+}
+
 // ===== LIVE CLOCK =====
 function updateClock() {
   const now = new Date();
@@ -186,7 +211,185 @@ function startLiveTracking() {
   state.liveInterval = setInterval(() => {
     const r = calcResult();
     updateProgress(r);
-  }, 30000); // update every 30s
+    saveDay(); // persist progress every 30s
+  }, 30000);
+}
+
+// ===== REPORTS =====
+let reportState = { tab: 'weekly', monthOffset: 0 };
+
+function openReports() {
+  const overlay = document.getElementById('reportsOverlay');
+  overlay.style.display = 'flex';
+  requestAnimationFrame(() => overlay.classList.add('reports-open'));
+  renderReports();
+}
+
+function closeReports() {
+  const overlay = document.getElementById('reportsOverlay');
+  overlay.classList.remove('reports-open');
+  setTimeout(() => { overlay.style.display = 'none'; }, 280);
+}
+
+function switchReportTab(tab) {
+  reportState.tab = tab;
+  document.getElementById('tabWeekly').classList.toggle('active', tab === 'weekly');
+  document.getElementById('tabMonthly').classList.toggle('active', tab === 'monthly');
+  renderReports();
+}
+
+function changeMonth(delta) {
+  reportState.monthOffset = Math.max(-24, Math.min(0, reportState.monthOffset + delta));
+  renderReports();
+}
+
+function renderReports() {
+  const body = document.getElementById('reportsBody');
+  body.innerHTML = reportState.tab === 'weekly' ? renderWeekly() : renderMonthly();
+}
+
+// ===== WEEKLY REPORT =====
+function getWeekDays(refDate = new Date()) {
+  const d = new Date(refDate);
+  const dow = d.getDay();
+  const diff = dow === 0 ? -6 : 1 - dow;
+  d.setDate(d.getDate() + diff);
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const dd = new Date(d);
+    dd.setDate(d.getDate() + i);
+    days.push(dd);
+  }
+  return days;
+}
+
+function renderWeekly() {
+  const history = getHistory();
+  const days = getWeekDays();
+  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const today = getDateKey(new Date());
+
+  const dayData = days.map((d, i) => ({
+    key: getDateKey(d), date: d, entry: history[getDateKey(d)] || null, name: dayNames[i]
+  }));
+
+  const workedDays = dayData.filter(d => d.entry && d.key <= today);
+  const totalWorked = workedDays.reduce((s, d) => s + d.entry.workedMinutes, 0);
+  const goalMetDays = workedDays.filter(d => d.entry.pct >= 100).length;
+  const avgMins = workedDays.length > 0 ? Math.round(totalWorked / workedDays.length) : 0;
+
+  let streak = 0;
+  for (const { key, entry } of [...dayData].filter(d => d.key <= today).reverse()) {
+    if (entry && entry.pct >= 100) streak++;
+    else break;
+  }
+
+  const maxMins = Math.max(...dayData.map(d => d.entry ? d.entry.workedMinutes : 0), 60);
+  const weekRange = `${days[0].toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} \u2013 ${days[6].toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+
+  const bars = dayData.map(({ key, entry, name }) => {
+    const isToday = key === today;
+    const isFuture = key > today;
+    const h = entry ? Math.max(4, Math.round((entry.workedMinutes / maxMins) * 100)) : 0;
+    const pct = entry ? entry.pct : 0;
+    const cls = isFuture ? 'bar-future' : (!entry ? 'bar-empty' : pct >= 100 ? 'bar-met' : pct >= 60 ? 'bar-mid' : 'bar-low');
+    return `
+      <div class="week-bar-col${isToday ? ' is-today' : ''}">
+        <div class="week-bar-val">${entry ? fmtDuration(entry.workedMinutes) : (isFuture ? '' : '\u2014')}</div>
+        <div class="week-bar-track"><div class="week-bar-fill ${cls}" style="height:${h}%"></div></div>
+        <div class="week-bar-label">${name}</div>
+        ${isToday ? '<div class="today-pip"></div>' : ''}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="report-section-title">
+      <span>\uD83D\uDCC5 This Week</span>
+      <span class="report-range">${weekRange}</span>
+    </div>
+    <div class="week-bars">${bars}</div>
+    <div class="report-stats-row">
+      <div class="rstat"><span class="rstat-val">${fmtDuration(totalWorked)}</span><span class="rstat-label">Total</span></div>
+      <div class="rstat"><span class="rstat-val">${avgMins > 0 ? fmtDuration(avgMins) : '\u2014'}</span><span class="rstat-label">Daily Avg</span></div>
+      <div class="rstat"><span class="rstat-val${goalMetDays > 0 ? ' val-green' : ''}">${goalMetDays} / ${workedDays.length}</span><span class="rstat-label">Goals Met</span></div>
+      <div class="rstat"><span class="rstat-val${streak > 0 ? ' val-orange' : ''}">${streak}${streak > 0 ? ' \uD83D\uDD25' : ''}</span><span class="rstat-label">Streak</span></div>
+    </div>`;
+}
+
+// ===== MONTHLY HEATMAP =====
+function renderMonthly() {
+  const history = getHistory();
+  const now = new Date();
+  const target = new Date(now.getFullYear(), now.getMonth() + reportState.monthOffset, 1);
+  const year = target.getFullYear();
+  const month = target.getMonth();
+  const monthName = target.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const today = getDateKey(now);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  let startDow = new Date(year, month, 1).getDay();
+  startDow = startDow === 0 ? 6 : startDow - 1;
+
+  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  let totalWorked = 0, daysGoalMet = 0, workedCount = 0;
+  let bestDay = { mins: 0, label: '' };
+
+  const cellsHtml = cells.map(dayNum => {
+    if (dayNum === null) return '<div class="heat-cell heat-pad"></div>';
+    const d = new Date(year, month, dayNum);
+    const key = getDateKey(d);
+    const entry = history[key];
+    const isFuture = key > today;
+    const isToday = key === today;
+    const shortDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    let level = 0, tip = shortDate;
+    if (entry) {
+      totalWorked += entry.workedMinutes;
+      workedCount++;
+      if (entry.pct >= 100) daysGoalMet++;
+      if (entry.workedMinutes > bestDay.mins) bestDay = { mins: entry.workedMinutes, label: shortDate };
+      if (entry.pct >= 110) level = 5;
+      else if (entry.pct >= 100) level = 4;
+      else if (entry.pct >= 60)  level = 3;
+      else if (entry.pct >= 30)  level = 2;
+      else level = 1;
+      tip = `${shortDate}: ${fmtDuration(entry.workedMinutes)} \u00B7 ${entry.pct}% of goal`;
+    } else if (!isFuture) {
+      tip = `${shortDate}: No data`;
+    }
+    return `<div class="heat-cell level-${level}${isToday ? ' heat-today' : ''}${isFuture ? ' heat-future' : ''}" title="${tip}"><span class="heat-num">${dayNum}</span></div>`;
+  }).join('');
+
+  const avgMins = workedCount > 0 ? Math.round(totalWorked / workedCount) : 0;
+  const canPrev = reportState.monthOffset > -24;
+  const canNext = reportState.monthOffset < 0;
+
+  return `
+    <div class="monthly-nav">
+      <button class="month-nav-btn" onclick="changeMonth(-1)" ${canPrev ? '' : 'disabled'}>&#8249;</button>
+      <span class="monthly-title">${monthName}</span>
+      <button class="month-nav-btn" onclick="changeMonth(1)" ${canNext ? '' : 'disabled'}>&#8250;</button>
+    </div>
+    <div class="heat-wrap">
+      <div class="heat-day-labels">${dayLabels.map(l => `<div class="heat-dlabel">${l}</div>`).join('')}</div>
+      <div class="heat-grid">${cellsHtml}</div>
+    </div>
+    <div class="heat-legend">
+      <span class="legend-label">Less</span>
+      ${[0,1,2,3,4,5].map(l => `<div class="heat-cell level-${l} legend-cell"></div>`).join('')}
+      <span class="legend-label">More</span>
+    </div>
+    <div class="report-stats-row">
+      <div class="rstat"><span class="rstat-val">${fmtDuration(totalWorked)}</span><span class="rstat-label">Total</span></div>
+      <div class="rstat"><span class="rstat-val">${avgMins > 0 ? fmtDuration(avgMins) : '\u2014'}</span><span class="rstat-label">Daily Avg</span></div>
+      <div class="rstat"><span class="rstat-val${daysGoalMet > 0 ? ' val-green' : ''}">${daysGoalMet} days</span><span class="rstat-label">Goals Met</span></div>
+      <div class="rstat"><span class="rstat-val">${bestDay.mins > 0 ? fmtDuration(bestDay.mins) : '\u2014'}</span><span class="rstat-label">Best Day</span></div>
+    </div>`;
 }
 
 // ===== FLOW =====
@@ -219,6 +422,7 @@ async function showResult() {
   state.step = 'done';
   const r = calcResult();
   updateProgress(r);
+  saveDay(); // save when session starts
   startLiveTracking();
 
   const summary = r.remaining === 0
@@ -301,10 +505,6 @@ async function handleSend(e) {
 
 // ===== QUICK SELECTS =====
 async function quickSelect(val) {
-  if (state.step === 'done' && val !== 'custom') {
-    // Allow changing goal mid-session from done state
-  }
-
   if (val === 'custom') {
     state.step = 'customGoal';
     document.getElementById('btn6h').classList.remove('active');
@@ -315,7 +515,7 @@ async function quickSelect(val) {
     return;
   }
 
-  if (state.step !== 'askGoal' && state.step !== 'customGoal' && state.step !== 'welcome') return;
+  if (state.step !== 'askGoal' && state.step !== 'customGoal') return;
 
   state.goalHours = val;
   document.getElementById('btn6h').classList.toggle('active', val === 6);
@@ -329,7 +529,8 @@ async function quickSelect(val) {
 // ===== RESET =====
 function resetAll() {
   if (state.liveInterval) clearInterval(state.liveInterval);
-  state.step = 'askGoal'; // set immediately so quickSelect guard works right away
+  saveDay(); // final save before clearing
+  state.step = 'askGoal';
   state.goalHours = null;
   state.startTime = null;
   state.breakMinutes = 0;

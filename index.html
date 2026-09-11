@@ -52,6 +52,7 @@
         <button class="quick-btn" id="btn6h" onclick="quickSelect(6)">6h Goal</button>
         <button class="quick-btn" id="btn8h" onclick="quickSelect(8)">8h Goal</button>
         <button class="quick-btn" onclick="quickSelect('custom')">Custom</button>
+        <button class="quick-btn teal" onclick="openReports()">📊 Reports</button>
         <button class="quick-btn accent" onclick="resetAll()">Reset</button>
       </div>
       <form class="input-row" id="inputForm" onsubmit="handleSend(event)">
@@ -72,6 +73,21 @@
       </form>
     </div>
   </main>
+
+  <!-- Reports Overlay -->
+  <div class="reports-overlay" id="reportsOverlay" style="display:none" onclick="if(event.target===this)closeReports()">
+    <div class="reports-panel">
+      <div class="reports-header">
+        <span class="reports-title">📊 Reports</span>
+        <button class="reports-close" onclick="closeReports()" aria-label="Close reports">✕</button>
+      </div>
+      <div class="reports-tabs">
+        <button class="report-tab active" id="tabWeekly" onclick="switchReportTab('weekly')">📅 Weekly</button>
+        <button class="report-tab" id="tabMonthly" onclick="switchReportTab('monthly')">🗓 Monthly</button>
+      </div>
+      <div class="reports-body" id="reportsBody"></div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
