@@ -1,0 +1,17 @@
+# Secret credentials — never commit!
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
