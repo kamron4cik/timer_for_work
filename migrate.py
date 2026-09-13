@@ -151,3 +151,9 @@ def run_migration():
         migrated_users, migrated_sessions,
     )
     print(f"✅ Migration complete: {migrated_users} user(s), {migrated_sessions} session(s) imported.")
+
+
+if __name__ == "__main__":
+    init_db()
+    run_migration()
+
