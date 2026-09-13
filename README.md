@@ -1,82 +1,77 @@
-# WorkBot 🤖 — Telegram Daily Hours Tracker
+# WorkBot — Professional Telegram Work-Time Tracker
 
-Track your daily working hours directly in Telegram with pause/resume and a full timeline log.
+A professional Telegram bot for tracking and calculating working hours with full automation, accuracy, and reliability.
 
----
+## Features
 
-## ⚙️ Setup
+- **Accurate event-based timer** — never drifts; calculated from stored timestamps, not counters
+- **Auto lunch-break** — pauses at 13:00, resumes at 14:00 automatically
+- **Dynamic completion notification** — fires at the *exact* projected done time based on your actual start
+- **Non-working day detection** — Saturday/Sunday are off; "Start Anyway" for extra work
+- **Holiday support** — mark specific dates as non-working
+- **Manual breaks** — pause/resume any time; each break stored separately
+- **Historical corrections** — edit start/end time, add breaks, delete sessions
+- **CSV & Excel export** — today / this week / this month with styled `.xlsx`
+- **Weekly & monthly reports** — detailed breakdown with progress bars
+- **Session recovery** — bot restores all jobs after a restart
+- **Configurable schedule** — per-weekday work hours and required hours
 
-### 1. Get a Bot Token
-1. Open Telegram and search for **@BotFather**
-2. Send `/newbot`
-3. Choose a name (e.g. *My WorkBot*) and a username (e.g. *myworkbot_bot*)
-4. BotFather will give you a token like: `7123456789:AAFxxxxxx`
+## Setup
 
-### 2. Create your `.env` file
 ```bash
-cp .env.example .env
-```
-Open `.env` and replace the placeholder with your real token:
-```
-BOT_TOKEN=7123456789:AAFxxxxxx
-```
-
-### 3. Install dependencies
-```bash
+# Install dependencies
 pip3 install -r requirements.txt
-```
 
-### 4. Run the bot
-```bash
+# Configure
+cp .env.example .env
+# Edit .env and set your BOT_TOKEN
+# Optionally set TIMEZONE (default: Asia/Tashkent)
+
+# Run
 python3 bot.py
 ```
 
----
+## File Structure
 
-## 🎮 Commands
+| File | Purpose |
+|------|---------|
+| `bot.py` | Telegram handlers, keyboards, message formatting |
+| `db.py` | SQLAlchemy ORM models + query helpers (SQLite) |
+| `calculator.py` | Pure deterministic working-time engine |
+| `scheduler.py` | Background job logic (reminders, lunch, done notification) |
+| `exporter.py` | CSV + Excel export |
+| `config.py` | Default schedule constants |
+| `migrate.py` | One-time migration from legacy `user_data.json` |
+| `workbot.db` | SQLite database (auto-created on first run) |
+
+## Commands
 
 | Command | Description |
-|---|---|
-| `/start` | Welcome + show controls |
-| `/setgoal [hours]` | Set daily goal (default 6h) |
+|---------|-------------|
+| `/start` | Welcome message + current status |
 | `/begin` | Start work session |
-| `/pause` | Pause (start a break) |
-| `/resume` | Resume working |
-| `/status` | Show progress + timeline |
-| `/done` | End session + final summary |
-| `/reset` | Clear & start over |
-| `/report` | Weekly & monthly work reports |
+| `/pause` | Start a manual break |
+| `/resume` | Resume from break |
+| `/status` | Live status card with timer |
+| `/done` or `/stop` | Finish session early |
+| `/report` | Weekly/monthly work reports |
+| `/export` | Export to CSV or Excel |
+| `/holiday` | Manage holidays & non-working days |
+| `/edit` | Correct session times or add breaks |
+| `/setgoal` | Set daily work goal (hours) |
+| `/reset` | Reset today's session |
 
-All commands are also available as **inline buttons** — no typing needed!
+## Default Schedule
 
----
+Configured in `config.py`:
+- **Working days:** Monday–Friday
+- **Hours:** 09:00–18:00
+- **Mandatory lunch:** 13:00–14:00
+- **Required work:** 8 hours/day
+- **Timezone:** Asia/Tashkent (UTC+5)
 
-## 📅 Timeline Feature
+## Database Schema
 
-Every pause and resume is logged as a separate entry. The `/status` command shows your full daily timeline:
+Tables: `users`, `work_schedules`, `break_schedules`, `work_sessions`, `breaks`, `holidays`, `notification_logs`
 
-```
-💼 Work   09:00 → 10:30  (1h 30m)
-☕ Break  10:30 → 11:00  (30m)
-💼 Work   11:00 → 13:00  (2h 00m)
-🍱 Break  13:00 → 14:00  (1h 00m)  (Lunch Break)
-💼 Work   14:00 → 16:30  (2h 30m)  ← now
-```
-
----
-
-## 🍱 Automatic Lunch Break (13:00 – 14:00)
-- The bot automatically pauses the timer at **13:00** for lunch break and notifies you.
-- At **14:00**, it automatically resumes your work timer.
-- If you work through lunch, a **▶️ Work Anyway** button lets you override the pause anytime.
-- Custom daily goals (e.g. 4 hours) are permanently saved and preserved even when resetting the day.
-
----
-
-## 🕐 Time Zone
-The bot defaults to **Asia/Tashkent (UTC+5)**. To change it, edit this line in `bot.py`:
-```python
-LOCAL_TZ = ZoneInfo("Asia/Tashkent")
-```
-Replace with your zone, e.g. `"Europe/London"`, `"America/New_York"`, etc.
-# timer_for_work
+All timestamps stored as UTC. All display is done in the user's configured timezone.

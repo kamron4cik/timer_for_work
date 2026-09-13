@@ -1,6 +1,15 @@
 # Secret credentials & runtime data — never commit!
 .env
 user_data.json
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Exports
+*.xlsx
+*.csv
 
 # Python cache
 __pycache__/

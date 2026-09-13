@@ -1,38 +1,52 @@
 """
-WorkBot — Friendly Telegram Daily Working Hours Tracker
-• Auto-notifies when goal is reached 🎉
-• Milestone celebrations at 25 / 50 / 75 %
-• Randomised, warm, human responses for every action
-• Gentle error messages — no harsh warnings
-• Preserves user's custom saved goal across resets & deployments
-• Automatic lunch break pause from 13:00 to 14:00
-• Server-ready: Persists active sessions so restarts don't lose working hours
-• Weekly & Monthly Reports with interactive buttons 📊
+WorkBot — Professional Telegram Work-Time Tracker
+==================================================
+A complete rewrite with:
+  • SQLite database (SQLAlchemy ORM)
+  • Accurate event-based time calculation
+  • Configurable weekly schedule + holidays
+  • Automatic lunch-break pause/resume
+  • Dynamic work-completion notification
+  • CSV & Excel export
+  • Historical corrections (edit start/end, add/remove breaks)
+  • Non-working day detection with "Start Anyway" option
+  • Session recovery after restarts
 """
 
-import os
-import json
-import random
-import logging
-from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
+from __future__ import annotations
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+import logging
+import random
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+from typing import Optional
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputFile,
+)
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, filters, ContextTypes,
 )
 
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN", "")
-LOCAL_TZ = ZoneInfo("Asia/Tashkent")   # UTC+5  ← change if needed
+from config import BOT_TOKEN
+from db import (
+    init_db, get_db, get_or_create_user, get_active_session, get_open_break,
+    get_schedule_for_weekday, is_holiday, get_sessions_for_range,
+    WorkSession, Break, Holiday, User, WorkSchedule,
+)
+from calculator import (
+    calculate, BreakPeriod, CalcResult,
+    fmt_dur, fmt_t, fmt_dt, pbar,
+)
+from scheduler import (
+    schedule_daily_jobs, start_safety_net, stop_safety_net,
+    cancel_done_job, schedule_done_job, restore_scheduler_jobs,
+    _calc_session, _reschedule_done_job_for,
+)
+from migrate import run_migration
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -40,828 +54,710 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Conversation states ────────────────────────────────────────
 ASK_GOAL = 0
-DATA_FILE = os.path.join(os.path.dirname(__file__), "user_data.json")
+ASK_EDIT_CHOICE = 10
+ASK_EDIT_VALUE  = 11
+ASK_HOLIDAY_DATE = 20
+ASK_HOLIDAY_REASON = 21
 
-# ── Serialization Helpers ─────────────────────────────────────
-def now_local() -> datetime:
-    return datetime.now(tz=LOCAL_TZ)
-
-def is_lunch_time(dt: datetime | None = None) -> bool:
-    t = dt or now_local()
-    return 13 <= t.hour < 14
-
-def serialize_session(sess: dict) -> dict:
-    return {
-        "goal_hours": sess["goal_hours"],
-        "status": sess["status"],
-        "start_time": sess["start_time"].isoformat() if sess["start_time"] else None,
-        "timeline": [
-            {
-                "type": s["type"],
-                "start": s["start"].isoformat() if s.get("start") else None,
-                "end": s["end"].isoformat() if s.get("end") else None,
-            }
-            for s in sess.get("timeline", [])
-        ],
-        "current_seg": {
-            "type": sess["current_seg"]["type"],
-            "start": sess["current_seg"]["start"].isoformat() if sess["current_seg"].get("start") else None,
-            "end": sess["current_seg"]["end"].isoformat() if sess["current_seg"].get("end") else None,
-        } if sess.get("current_seg") else None,
-        "chat_id": sess.get("chat_id"),
-        "milestones_sent": list(sess.get("milestones_sent", [])),
-        "auto_lunch_paused": sess.get("auto_lunch_paused", False),
-        "lunch_override": sess.get("lunch_override", False),
-    }
-
-def deserialize_session(d: dict) -> dict:
-    def parse_dt(s):
-        if not s:
-            return None
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=LOCAL_TZ)
-        return dt
-
-    return {
-        "goal_hours": float(d.get("goal_hours", 6.0)),
-        "status": d.get("status", "idle"),
-        "start_time": parse_dt(d.get("start_time")),
-        "timeline": [
-            {
-                "type": s["type"],
-                "start": parse_dt(s["start"]),
-                "end": parse_dt(s["end"]),
-            }
-            for s in d.get("timeline", [])
-        ],
-        "current_seg": {
-            "type": d["current_seg"]["type"],
-            "start": parse_dt(d["current_seg"]["start"]),
-            "end": parse_dt(d["current_seg"]["end"]),
-        } if d.get("current_seg") else None,
-        "chat_id": d.get("chat_id"),
-        "milestones_sent": set(d.get("milestones_sent", [])),
-        "auto_lunch_paused": d.get("auto_lunch_paused", False),
-        "lunch_override": d.get("lunch_override", False),
-    }
-
-# ── Data Persistence ──────────────────────────────────────────
-def load_data() -> tuple[dict[int, float], dict[int, dict], dict[int, dict]]:
-    if not os.path.exists(DATA_FILE):
-        return {}, {}, {}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-            goals = {int(k): float(v) for k, v in raw.get("goals", {}).items()}
-            loaded_sessions = {}
-            for k, v in raw.get("sessions", {}).items():
-                try:
-                    loaded_sessions[int(k)] = deserialize_session(v)
-                except Exception as e:
-                    logger.warning("Error deserializing session %s: %s", k, e)
-            history = {int(k): v for k, v in raw.get("history", {}).items()}
-            return goals, loaded_sessions, history
-    except Exception as e:
-        logger.warning("Error loading %s: %s", DATA_FILE, e)
-        return {}, {}, {}
-
-def save_data():
-    try:
-        data = {
-            "goals": {str(k): v for k, v in user_goals.items()},
-            "sessions": {str(k): serialize_session(v) for k, v in sessions.items()},
-            "history": {str(k): v for k, v in user_history.items()},
-        }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.warning("Error saving %s: %s", DATA_FILE, e)
-
-user_goals, sessions, user_history = load_data()
-
-def save_user_goal(uid: int, goal_hours: float):
-    user_goals[uid] = goal_hours
-    save_data()
-
-def record_day_history(uid: int):
-    sess = get_sess(uid)
-    d_str = now_local().strftime("%Y-%m-%d")
-    s = calc(sess)
-    if uid not in user_history:
-        user_history[uid] = {}
-    user_history[uid][d_str] = {
-        "worked": s["worked"],
-        "resting": s["resting"],
-        "goal": s["goal"],
-        "completed": s["remaining"] == 0,
-    }
-    save_data()
-
-# ── Per-user state ────────────────────────────────────────────
-def get_sess(uid: int) -> dict:
-    if uid not in sessions:
-        sessions[uid] = {
-            "goal_hours": user_goals.get(uid, 6.0),
-            "status": "idle",          # idle | working | paused | done
-            "start_time": None,
-            "timeline": [],
-            "current_seg": None,
-            "chat_id": None,
-            "milestones_sent": set(),
-            "auto_lunch_paused": False,
-            "lunch_override": False,
-        }
-        save_data()
-    return sessions[uid]
-
-def reset_session(uid: int, chat_id: int | None = None) -> dict:
-    user_goal = user_goals.get(uid, sessions.get(uid, {}).get("goal_hours", 6.0))
-    sess = {
-        "goal_hours": user_goal,
-        "status": "idle",
-        "start_time": None,
-        "timeline": [],
-        "current_seg": None,
-        "chat_id": chat_id,
-        "milestones_sent": set(),
-        "auto_lunch_paused": False,
-        "lunch_override": False,
-    }
-    sessions[uid] = sess
-    save_data()
-    return sess
-
-# ── Randomised response bank ──────────────────────────────────
+# ── Random response pools ──────────────────────────────────────
 def r(pool: list[str]) -> str:
     return random.choice(pool)
 
-GREET = [
-    "Hey {name}! 👋 So glad you're here!",
-    "Welcome back, {name}! 😄 Ready to have a productive day?",
-    "Hi {name}! 🌟 Let's make today count!",
-    "Good to see you, {name}! 💪 Let's get to work!",
+BEGIN_MSGS = [
+    "🟢 *Timer started!*\n\n🕐 Clocked in at *{t}*\n🎯 Today's goal: *{goal}*\n\nI'll cheer you on at 25%, 50%, 75% and send a 🎉 the moment you're done! Let's go! 💪",
+    "▶️ *Work mode activated!*\n\n🕐 Started at *{t}*\n🎯 Target: *{goal}* of focused work\n\nYou've got this — I'm tracking every minute! 🏆",
+    "🚀 *And we're off!*\n\n🕐 Clock-in: *{t}*\n🎯 Goal for today: *{goal}*\n\nSit back and work — I'll handle the timekeeping! 😎",
+    "💼 *Session started!*\n\n🕐 Began at *{t}*\n🎯 Mission: *{goal}* today\n\nGo make it count! I'll ping you at every milestone. 🌟",
 ]
 
-BEGIN = [
-    "🚀 *Off we go!* Timer started at *{t}*\n🎯 Goal for today: *{goal}*\n\nI've got your back — I'll cheer you on at every milestone and shout the moment you're done! 🎉",
-    "▶️ *Let's do this!* Clocked in at *{t}*\n🎯 Today's goal: *{goal}*\n\nSit tight — I'll ping you at 25%, 50%, 75%, and *celebrate* when you hit 100%! 🏆",
-    "💼 *Work mode: ON!* Started at *{t}*\n🎯 You're going for *{goal}* today!\n\nI'll be watching your progress and give you a shout when it's time to celebrate! 🎊",
-    "⏱ *Timer running!* Clock-in: *{t}*\n🎯 Mission: *{goal}* of focused work!\n\nYou've got this. I'll celebrate every milestone with you! 🌟",
+PAUSE_MSGS = [
+    "⏸ *Break started* — you've earned it!\n\n🕐 Paused at *{t}*\n⏱ Worked so far: *{worked}*\n\nRest up, grab a coffee ☕ — hit *Resume* when you're back!",
+    "☕ *Enjoy your break!*\n\n🕐 Paused at *{t}*\n⏱ Great progress: *{worked}* done\n\nI'll keep your time safe. See you soon! 😊",
+    "🧘 *Taking a breather?*\n\n🕐 Break at *{t}*\n⏱ *{worked}* logged so far — solid work!\n\nStep away, recharge, and come back fresh! 💆",
+    "🌿 *Break time!*\n\n🕐 Paused at *{t}*\n⏱ You've clocked *{worked}* — keep it up!\n\nI'm not going anywhere. Hit *▶️ Resume* whenever you're ready. 🙌",
 ]
 
-PAUSE = [
-    "⏸ *Break time — you've earned it!* ☕\nBreak started: *{t}*\nWorked so far: *{worked}*\n\nRelax, grab a coffee, stretch a little. I'll be here when you're back! 😊",
-    "☕ *Enjoy your break!* Paused at *{t}*\nGreat progress so far: *{worked}* in the bag!\n\nRest up — hit *▶️ Resume* whenever you're ready! 🙌",
-    "🧘 *Rest mode!* Taking a break at *{t}*\nYou've already clocked *{worked}* — nice work!\n\nStep away, breathe, come back fresh! 💆",
-    "⏸ *Pausing the clock at {t}* — well deserved!\nSo far: *{worked}* done!\n\nTake your time, I'm not going anywhere 😄",
+RESUME_MSGS = [
+    "▶️ *Welcome back!* Let's finish strong 💪\n\n🕐 Resumed at *{t}*\n⏱ Worked: *{worked}* · ⏳ Left: *{left}*\n\n{bar}",
+    "🔥 *Back in the zone!*\n\n🕐 Resumed at *{t}*\n⏱ Done: *{worked}* · ⏳ Remaining: *{left}*\n\n{bar}\n\nYou're doing amazing — keep going! 🚀",
+    "💼 *Clock's ticking again!*\n\n🕐 Resumed at *{t}*\n⏱ Progress: *{worked}* · ⏳ To go: *{left}*\n\n{bar}\n\nAlmost there — stay focused! 🎯",
+    "⚡ *Let's go!*\n\n🕐 Resumed at *{t}*\n⏱ Logged: *{worked}* · ⏳ Left: *{left}*\n\n{bar}",
 ]
 
-RESUME = [
-    "▶️ *Welcome back!* Ready to keep crushing it? 💪\nResumed at: *{t}*\n⏱ Worked: *{worked}* | ⏳ Remaining: *{left}*\n\n{bar}",
-    "🔥 *Back in the zone!* Resumed at *{t}*\n⏱ Done so far: *{worked}* | ⏳ Left: *{left}*\n\n{bar}\n\nYou're doing amazing — keep going!",
-    "💼 *And we're back!* Clocked in again at *{t}*\n⏱ Progress: *{worked}* | ⏳ To go: *{left}*\n\n{bar}\n\nLet's finish strong! 🏁",
-    "⚡ *Game on!* Resumed at *{t}*\n⏱ Worked: *{worked}* | ⏳ Remaining: *{left}*\n\n{bar}",
-]
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-DONE_GOAL = [
-    "🏆 *YOU DID IT!* Full *{goal}* goal smashed today!\n\n🕐 Started: *{start}* → Finished: *{end}*\n⏱ Worked: *{worked}* | ☕ Breaks: *{rest}*\n\n{bar}\n\n🎊 *Seriously — well done!* Go rest, you've earned it! 🌙\n\n{timeline}",
-    "🎉 *GOAL ACHIEVED!* You crushed your *{goal}* target!\n\n🕐 {start} → {end}\n⏱ Net work: *{worked}* | ☕ Rest: *{rest}*\n\n{bar}\n\n*That's what dedication looks like!* 🔥 Enjoy your evening! 🌙\n\n{timeline}",
-    "🏅 *MISSION COMPLETE!* *{goal}* of great work done!\n\n🕐 Started: *{start}* | Wrapped: *{end}*\n⏱ Total worked: *{worked}* | ☕ Breaks: *{rest}*\n\n{bar}\n\n*Be proud of yourself today!* 💙\n\n{timeline}",
-]
 
-DONE_PARTIAL = [
-    "🏁 *Day wrapped!*\n\n🕐 {start} → {end}\n⏱ Worked: *{worked}* | ☕ Breaks: *{rest}*\n🎯 Goal was: *{goal}*\n\n{bar}\n\n_Every bit of effort counts. See you tomorrow! 💙_\n\n{timeline}",
-    "🌅 *Session closed!*\n\n🕐 {start} → {end}\n⏱ You put in *{worked}* today — that's real! ☕ Rest: *{rest}*\n🎯 Goal: *{goal}*\n\n{bar}\n\n_Progress over perfection. Great job! 🤝_\n\n{timeline}",
-]
+# ── Keyboard builders ──────────────────────────────────────────
 
-ALREADY_WORKING = [
-    "😄 Hey, you're already on the clock! Use the buttons to pause, check status, or finish your day.",
-    "⏱ Timer's already running! No need to start again — use *⏸ Pause* or *📊 My Status* below.",
-    "💼 You're already in work mode! Tap *📊 My Status* to see how you're doing.",
-]
-
-NOT_WORKING = [
-    "🤔 Looks like you're not working right now! Hit *▶️ Start Working* to begin your session.",
-    "😴 No active session yet! Tap *▶️ Start Working* to kick things off.",
-    "👀 Timer hasn't started yet! Press *▶️ Start Working* when you're ready.",
-]
-
-NOT_ON_BREAK = [
-    "🙂 You're not on a break right now — you're working! Use *⏸ Pause* if you need a rest.",
-    "💡 You're still in work mode! Hit *⏸ Pause / Break* when you want to step away.",
-    "😄 No break is running! You're actively working. Tap *⏸ Pause* anytime you need a breather.",
-]
-
-ALREADY_PAUSED = [
-    "☕ You're already on a break! Hit *▶️ Resume Working* when you're ready to continue.",
-    "⏸ Break is already in progress! Tap *▶️ Resume* when you're back.",
-    "🧘 You're resting right now! Press *▶️ Resume Working* to get back to it.",
-]
-
-NO_SESSION = [
-    "👋 No active session found! Tap *▶️ Start Working* to begin tracking your day.",
-    "😊 Looks like you haven't started yet! Hit *▶️ Start Working* to begin.",
-    "🌅 Nothing to show yet! Start a session first with *▶️ Start Working*.",
-]
-
-MILESTONE = {
-    25: [
-        "🌱 *25% done!* You're off to a great start! Keep that energy going! ⚡",
-        "✨ *Quarter way there!* Solid beginning — you've got this! 💪",
-        "🎯 *25% complete!* One step at a time — you're building momentum! 🔥",
-    ],
-    50: [
-        "🔥 *HALFWAY THERE!* You're absolutely smashing it today! 💥",
-        "⚡ *50% done!* Right in the middle — the finish line is getting closer! 🏁",
-        "🎊 *Half the goal done!* You're on fire! Keep the momentum! 🚀",
-    ],
-    75: [
-        "⚡ *75% complete!* Almost there — don't stop now! The end is so close! 🏆",
-        "🏃 *Three quarters done!* One final push and you're there! You've got this! 💪",
-        "🌟 *75% — incredible!* Just a little more and I'll be sending that goal notification! 🎉",
-    ],
-}
-
-GOAL_REACHED = [
-    "🎉🎉🎉 *HOORAY! YOU DID IT!*\n\nYou've just completed your *{goal}* daily goal! That's amazing!\n\n⏱ Total worked: *{worked}*\n☕ Break time: *{rest}*\n\n{bar}\n\n{timeline}\n\n🌙 *Rest well — you absolutely deserve it!* See you tomorrow! 💙",
-    "🏆 *GOAL SMASHED!* Congratulations!\n\nYou've hit your full *{goal}* for today! Incredible work!\n\n⏱ Worked: *{worked}* | ☕ Breaks: *{rest}*\n\n{bar}\n\n{timeline}\n\n🎊 *Be proud of yourself — seriously!* Now go relax! 🛋",
-    "🥳 *MISSION ACCOMPLISHED!*\n\nYou crushed your *{goal}* target today! Nothing can stop you!\n\n⏱ Net work: *{worked}* | ☕ Rest: *{rest}*\n\n{bar}\n\n{timeline}\n\n⭐ *Outstanding effort today!* You earned a proper rest! 🌙",
-]
-
-# ── Helpers ───────────────────────────────────────────────────
-def fmt_t(dt: datetime | None) -> str:
-    return dt.strftime("%H:%M") if dt else "—"
-
-def fmt_dur(secs: float) -> str:
-    secs = max(0, int(secs))
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    if h > 0:
-        return f"{h}h {m:02d}m"
-    if m > 0:
-        return f"{m}m {s:02d}s"
-    return f"{s}s"
-
-def pbar(pct: int, w: int = 14) -> str:
-    f = int(w * pct / 100)
-    return f"`{'▓'*f}{'░'*(w-f)}` *{pct}%*"
-
-def calc(sess: dict) -> dict:
-    now = now_local()
-    worked = resting = 0.0
-    for seg in sess["timeline"]:
-        end = seg["end"] or now
-        d = (end - seg["start"]).total_seconds()
-        if seg["type"] == "work":
-            worked += d
-        else:
-            resting += d
-    if sess["current_seg"]:
-        d = (now - sess["current_seg"]["start"]).total_seconds()
-        if sess["current_seg"]["type"] == "work":
-            worked += d
-        else:
-            resting += d
-    goal = sess["goal_hours"] * 3600
-    remaining = max(0.0, goal - worked)
-    pct = min(100, int(worked / goal * 100)) if goal else 0
-    finish = None
-    if remaining > 0 and sess["status"] == "working":
-        finish = datetime.fromtimestamp(now.timestamp() + remaining, tz=LOCAL_TZ)
-    return dict(worked=worked, resting=resting, goal=goal,
-                remaining=remaining, pct=pct, finish=finish)
-
-def close_seg(sess: dict):
-    if sess["current_seg"]:
-        s = sess["current_seg"].copy()
-        s["end"] = now_local()
-        sess["timeline"].append(s)
-        sess["current_seg"] = None
-
-def open_seg(sess: dict, kind: str):
-    close_seg(sess)
-    sess["current_seg"] = {"type": kind, "start": now_local(), "end": None}
-
-def timeline_text(sess: dict) -> str:
-    segs = list(sess["timeline"])
-    if sess["current_seg"]:
-        segs.append({**sess["current_seg"], "_open": True})
-    if not segs:
-        return ""
-    lines = ["*📅 Timeline*", ""]
-    for s in segs:
-        icon = "💼" if s["type"] == "work" else "☕"
-        is_open = s.get("_open", False)
-        end = s.get("end")
-        end_str = "now ←" if is_open else fmt_t(end)
-        d = ((end or now_local()) - s["start"]).total_seconds()
-        lines.append(f"{icon}  {fmt_t(s['start'])} → {end_str}   _({fmt_dur(d)})_")
-    return "\n".join(lines)
-
-def status_card(sess: dict) -> str:
-    s = calc(sess)
-    status = sess["status"]
-    if status == "paused" and sess.get("auto_lunch_paused") and is_lunch_time():
-        emoji = "🍱"
-        label = "Lunch Break (Paused until 14:00)"
-    else:
-        emoji = {"idle": "😴", "working": "💼", "paused": "☕", "done": "✅"}.get(status, "")
-        label = {"idle": "Idle", "working": "Working", "paused": "On Break", "done": "Done"}.get(status, "")
-
-    lines = [
-        "*WorkBot — Your Day* 📊",
-        "",
-        f"{emoji}  Status: *{label}*   |   🎯 Goal: *{fmt_dur(s['goal'])}*",
-        "",
-        f"⏱  Worked:     *{fmt_dur(s['worked'])}*",
-        f"☕  Breaks:     *{fmt_dur(s['resting'])}*",
-        f"⏳  Remaining:  *{fmt_dur(s['remaining'])}*",
-        "",
-        pbar(s["pct"]),
-    ]
-    if s["finish"]:
-        lines += ["", f"🏁  Finish by: *{fmt_t(s['finish'])}*"]
-    if sess["status"] == "done" and s["remaining"] == 0:
-        lines += ["", "🎉 *Goal achieved!*"]
-    return "\n".join(lines)
-
-# ── Reports Logic ─────────────────────────────────────────────
-def get_weekly_report(uid: int) -> str:
-    now = now_local()
-    today = now.date()
-    start_of_week = today - timedelta(days=today.weekday())
-    end_of_week = start_of_week + timedelta(days=6)
-
-    sess = get_sess(uid)
-    hist = user_history.get(uid, {})
-
-    total_worked = 0.0
-    days_worked = 0
-    goals_met = 0
-    day_lines = []
-
-    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    for i in range(7):
-        d = start_of_week + timedelta(days=i)
-        d_str = d.strftime("%Y-%m-%d")
-        worked = 0.0
-        goal = sess["goal_hours"] * 3600
-
-        if d == today and sess["status"] in ("working", "paused", "done"):
-            s = calc(sess)
-            worked = s["worked"]
-            goal = s["goal"]
-        elif d_str in hist:
-            entry = hist[d_str]
-            worked = entry.get("worked", 0.0)
-            goal = entry.get("goal", goal)
-
-        total_worked += worked
-        is_today = (d == today)
-        is_future = (d > today)
-
-        if worked > 0:
-            days_worked += 1
-            if worked >= goal:
-                goals_met += 1
-                badge = "✅"
-            else:
-                badge = "⏳" if is_today else "⚡"
-            day_lines.append(f"• *{day_names[i]}, {d.strftime('%b %d')}:* {fmt_dur(worked)} {badge}")
-        else:
-            if is_today:
-                day_lines.append(f"• *{day_names[i]}, {d.strftime('%b %d')}:* _in progress_ ⏳")
-            elif is_future:
-                day_lines.append(f"• *{day_names[i]}, {d.strftime('%b %d')}:* —")
-            else:
-                day_lines.append(f"• *{day_names[i]}, {d.strftime('%b %d')}:* 0m")
-
-    weekly_target = sess["goal_hours"] * 3600 * 5
-    pct = min(100, int(total_worked / weekly_target * 100)) if weekly_target else 0
-    avg_worked = total_worked / days_worked if days_worked else 0.0
-
-    lines = [
-        f"📊 *Weekly Work Report* ({start_of_week.strftime('%b %d')} – {end_of_week.strftime('%b %d')})",
-        "",
-        f"⏱  Total Worked:    *{fmt_dur(total_worked)}*",
-        f"🎯  Weekly Target:   *{fmt_dur(weekly_target)}* ({pct}%)",
-        f"📈  Daily Average:   *{fmt_dur(avg_worked)}*",
-        f"🏆  Goals Hit:       *{goals_met} / {days_worked if days_worked else 5} days*",
-        "",
-        pbar(pct),
-        "",
-        "*📅 Daily Breakdown:*",
-        *day_lines,
-    ]
-    return "\n".join(lines)
-
-def get_monthly_report(uid: int) -> str:
-    now = now_local()
-    today = now.date()
-    month_name = now.strftime("%B %Y")
-    year = now.year
-    month = now.month
-
-    sess = get_sess(uid)
-    hist = user_history.get(uid, {})
-
-    total_worked = 0.0
-    days_worked = 0
-    goals_met = 0
-
-    for day_num in range(1, today.day + 1):
-        d = date(year, month, day_num)
-        d_str = d.strftime("%Y-%m-%d")
-        worked = 0.0
-        goal = sess["goal_hours"] * 3600
-
-        if d == today and sess["status"] in ("working", "paused", "done"):
-            s = calc(sess)
-            worked = s["worked"]
-            goal = s["goal"]
-        elif d_str in hist:
-            entry = hist[d_str]
-            worked = entry.get("worked", 0.0)
-            goal = entry.get("goal", goal)
-
-        if worked > 0:
-            total_worked += worked
-            days_worked += 1
-            if worked >= goal:
-                goals_met += 1
-
-    avg_worked = total_worked / days_worked if days_worked else 0.0
-    success_rate = int(goals_met / days_worked * 100) if days_worked else 0
-
-    lines = [
-        f"📆 *Monthly Work Report* ({month_name})",
-        "",
-        f"⏱  Total Worked:      *{fmt_dur(total_worked)}*",
-        f"💼  Active Days:       *{days_worked} days*",
-        f"📈  Average / Day:     *{fmt_dur(avg_worked)}*",
-        f"🎯  Days Target Met:   *{goals_met} / {days_worked}* ({success_rate}%)",
-        f"⭐  Daily Goal:        *{fmt_dur(sess['goal_hours']*3600)}*",
-    ]
-    return "\n".join(lines)
-
-# ── Keyboards ─────────────────────────────────────────────────
 def kb_idle():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️  Start Working", callback_data="begin")],
-        [InlineKeyboardButton("🎯  Set Goal",      callback_data="setgoal"),
-         InlineKeyboardButton("📈  Reports",       callback_data="reports_menu")],
+        [InlineKeyboardButton("▶️  Start Working",      callback_data="begin")],
+        [InlineKeyboardButton("🎯  Set Daily Goal",     callback_data="setgoal"),
+         InlineKeyboardButton("📅  My Schedule",        callback_data="view_schedule")],
+        [InlineKeyboardButton("📊  Reports",            callback_data="reports_menu"),
+         InlineKeyboardButton("📤  Export History",     callback_data="export_menu")],
+        [InlineKeyboardButton("🗓  Holidays & Days Off", callback_data="holiday_menu")],
     ])
 
 def kb_working():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏸  Pause / Break", callback_data="pause"),
-         InlineKeyboardButton("📊  My Status",     callback_data="status")],
-        [InlineKeyboardButton("🏁  Finish Day",    callback_data="done"),
-         InlineKeyboardButton("🔄  Reset",         callback_data="reset")],
+        [InlineKeyboardButton("⏸  Take a Break",       callback_data="pause"),
+         InlineKeyboardButton("📊  My Progress",        callback_data="status")],
+        [InlineKeyboardButton("🏁  Stop Work",          callback_data="done"),
+         InlineKeyboardButton("📤  Export",             callback_data="export_menu")],
+        [InlineKeyboardButton("✏️  Edit Session",       callback_data="edit_menu"),
+         InlineKeyboardButton("🔄  Reset Day",          callback_data="reset")],
     ])
 
 def kb_paused():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️  Resume Working", callback_data="resume"),
-         InlineKeyboardButton("📊  My Status",      callback_data="status")],
-        [InlineKeyboardButton("🏁  Finish Day",     callback_data="done"),
-         InlineKeyboardButton("🔄  Reset",          callback_data="reset")],
+        [InlineKeyboardButton("▶️  Resume Working",     callback_data="resume")],
+        [InlineKeyboardButton("📊  My Progress",        callback_data="status"),
+         InlineKeyboardButton("🏁  Stop Work",          callback_data="done")],
+        [InlineKeyboardButton("✏️  Edit Session",       callback_data="edit_menu"),
+         InlineKeyboardButton("🔄  Reset Day",          callback_data="reset")],
     ])
 
-def kb_lunch_paused():
+def kb_lunch():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️  Work Anyway", callback_data="lunch_override"),
-         InlineKeyboardButton("📊  My Status",   callback_data="status")],
-        [InlineKeyboardButton("🏁  Finish Day",  callback_data="done"),
-         InlineKeyboardButton("🔄  Reset",       callback_data="reset")],
+        [InlineKeyboardButton("🍱  Enjoy lunch! Back at 14:00", callback_data="status")],
+        [InlineKeyboardButton("▶️  Skip Lunch & Keep Working", callback_data="lunch_override")],
+        [InlineKeyboardButton("🏁  Stop Work for Today",       callback_data="done")],
     ])
 
 def kb_done():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄  Start New Day", callback_data="reset"),
-         InlineKeyboardButton("📈  Reports",       callback_data="reports_menu")],
+        [InlineKeyboardButton("🌅  Start a New Session",  callback_data="reset")],
+        [InlineKeyboardButton("📊  Today's Summary",      callback_data="status"),
+         InlineKeyboardButton("📊  Reports",              callback_data="reports_menu")],
+        [InlineKeyboardButton("📤  Export History",       callback_data="export_menu"),
+         InlineKeyboardButton("✏️  Correct Session",      callback_data="edit_menu")],
+    ])
+
+def kb_nonworking():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀  Work Anyway (Extra Day)", callback_data="begin_extra")],
+        [InlineKeyboardButton("📅  View My Schedule",        callback_data="view_schedule"),
+         InlineKeyboardButton("📊  Reports",                 callback_data="reports_menu")],
     ])
 
 def kb_reports_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅  This Week",  callback_data="report_week"),
-         InlineKeyboardButton("📆  This Month", callback_data="report_month")],
-        [InlineKeyboardButton("🔙  Back",       callback_data="reports_back")],
+        [InlineKeyboardButton("📅  This Week",    callback_data="report_week"),
+         InlineKeyboardButton("📆  This Month",   callback_data="report_month")],
+        [InlineKeyboardButton("📊  Today's Stats", callback_data="status"),
+         InlineKeyboardButton("🔙  Back",          callback_data="back_main")],
     ])
 
-def kb_report_view(current: str):
-    if current == "week":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📆  Switch to Month", callback_data="report_month")],
-            [InlineKeyboardButton("🔄  Refresh",         callback_data="report_week"),
-             InlineKeyboardButton("🔙  Back",            callback_data="reports_back")],
-        ])
-    else:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅  Switch to Week",  callback_data="report_week")],
-            [InlineKeyboardButton("🔄  Refresh",         callback_data="report_month"),
-             InlineKeyboardButton("🔙  Back",            callback_data="reports_back")],
-        ])
+def kb_export_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 CSV — Today",    callback_data="export_csv_today"),
+         InlineKeyboardButton("📊 Excel — Today",  callback_data="export_xlsx_today")],
+        [InlineKeyboardButton("📄 CSV — This Week",  callback_data="export_csv_week"),
+         InlineKeyboardButton("📊 Excel — This Week", callback_data="export_xlsx_week")],
+        [InlineKeyboardButton("📄 CSV — This Month",  callback_data="export_csv_month"),
+         InlineKeyboardButton("📊 Excel — This Month", callback_data="export_xlsx_month")],
+        [InlineKeyboardButton("🔙  Back",              callback_data="back_main")],
+    ])
 
-def kb_for(sess: dict):
-    st = sess["status"]
-    if st == "idle":
+def kb_edit_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🕐  Change Start Time",  callback_data="edit_start"),
+         InlineKeyboardButton("🕔  Change End Time",    callback_data="edit_end")],
+        [InlineKeyboardButton("➕  Add a Break",        callback_data="edit_add_break"),
+         InlineKeyboardButton("🗑  Delete Session",     callback_data="edit_delete")],
+        [InlineKeyboardButton("🔙  Back",               callback_data="back_main")],
+    ])
+
+def kb_holiday_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕  Add Day Off",         callback_data="holiday_add"),
+         InlineKeyboardButton("📋  See All Days Off",    callback_data="holiday_list")],
+        [InlineKeyboardButton("🔙  Back",                callback_data="back_main")],
+    ])
+
+def kb_for_session(sess: Optional[WorkSession]) -> InlineKeyboardMarkup:
+    if not sess:
         return kb_idle()
-    if st == "working":
+    status = sess.status
+    if status == "active":
         return kb_working()
-    if st == "paused":
-        if sess.get("auto_lunch_paused") and is_lunch_time():
-            return kb_lunch_paused()
+    if status == "paused":
         return kb_paused()
-    if st == "done":
+    if status == "lunch":
+        return kb_lunch()
+    if status == "done":
         return kb_done()
     return kb_idle()
 
-# ── Job queue helpers ─────────────────────────────────────────
-def start_job(app, uid: int, chat_id: int):
-    name = f"track_{uid}"
-    for j in app.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    app.job_queue.run_repeating(
-        progress_job, interval=30, first=10,
-        name=name, data={"uid": uid, "chat_id": chat_id}
-    )
 
-def stop_job(app, uid: int):
-    for j in app.job_queue.get_jobs_by_name(f"track_{uid}"):
-        j.schedule_removal()
+# ── User / session helpers ─────────────────────────────────────
 
-async def progress_job(ctx: ContextTypes.DEFAULT_TYPE):
-    d = ctx.job.data
-    uid, chat_id = d["uid"], d["chat_id"]
-    sess = sessions.get(uid)
-    if not sess or sess["status"] not in ("working", "paused"):
-        ctx.job.schedule_removal()
-        return
+def _user_tz(user: User) -> ZoneInfo:
+    return ZoneInfo(user.timezone)
 
-    now = now_local()
 
-    # ── Auto Lunch Pause (13:00 – 14:00) ──────────────────────────
-    if sess["status"] == "working":
-        if is_lunch_time(now) and not sess.get("lunch_override", False):
-            open_seg(sess, "break")
-            sess["status"] = "paused"
-            sess["auto_lunch_paused"] = True
-            save_data()
-            msg = (
-                "🍱 *Lunch Break Time (13:00 – 14:00)!* 🍽️\n\n"
-                "Your work timer has been automatically paused for lunch.\n"
-                "Enjoy your meal and take a breather! ☕🥪\n\n"
-                "I will automatically resume your timer at *14:00*! 🚀"
-            )
-            await ctx.bot.send_message(
-                chat_id=chat_id, text=msg,
-                parse_mode="Markdown", reply_markup=kb_lunch_paused()
-            )
-            return
+def _now_local(tz: ZoneInfo) -> datetime:
+    return datetime.now(tz=tz)
 
-    # ── Auto Lunch Resume at 14:00 ────────────────────────────────
-    elif sess["status"] == "paused":
-        if sess.get("auto_lunch_paused") and not is_lunch_time(now):
-            sess["auto_lunch_paused"] = False
-            sess["lunch_override"] = False
-            open_seg(sess, "work")
-            sess["status"] = "working"
-            save_data()
-            s = calc(sess)
-            msg = (
-                "🔔 *14:00 — Lunch Break Ended!* ⏰\n\n"
-                "Welcome back! Your work timer has automatically resumed.\n\n"
-                f"⏱ Worked so far: *{fmt_dur(s['worked'])}* | ⏳ Remaining: *{fmt_dur(s['remaining'])}*\n\n"
-                + pbar(s["pct"]) + "\n\n"
-                "Let's make this afternoon productive! 💪"
-            )
-            await ctx.bot.send_message(
-                chat_id=chat_id, text=msg,
-                parse_mode="Markdown", reply_markup=kb_working()
-            )
-            return
 
-    if sess["status"] != "working":
-        return
+def _now_utc() -> datetime:
+    return datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
 
-    s = calc(sess)
-    pct = s["pct"]
 
-    # ── Goal reached ──────────────────────────────────────────
-    if pct >= 100 and 100 not in sess["milestones_sent"]:
-        sess["milestones_sent"].add(100)
-        close_seg(sess)
-        sess["status"] = "done"
-        record_day_history(uid)
-        save_data()
-        ctx.job.schedule_removal()
-        tl = timeline_text(sess)
-        msg = r(GOAL_REACHED).format(
-            goal=fmt_dur(s["goal"]), worked=fmt_dur(s["worked"]),
-            rest=fmt_dur(s["resting"]), bar=pbar(100), timeline=tl
-        )
-        await ctx.bot.send_message(chat_id=chat_id, text=msg,
-                                   parse_mode="Markdown", reply_markup=kb_done())
-        return
+def _to_utc(dt: datetime) -> datetime:
+    return dt.astimezone(ZoneInfo("UTC"))
 
-    # ── Milestone messages ─────────────────────────────────────
-    for threshold in (25, 50, 75):
-        if pct >= threshold and threshold not in sess["milestones_sent"]:
-            sess["milestones_sent"].add(threshold)
-            save_data()
-            s2 = calc(sess)
-            text = (
-                r(MILESTONE[threshold]) + "\n\n"
-                f"⏱ Worked: *{fmt_dur(s2['worked'])}*  |  ⏳ Left: *{fmt_dur(s2['remaining'])}*\n\n"
-                + pbar(s2["pct"])
-            )
-            await ctx.bot.send_message(chat_id=chat_id, text=text,
-                                       parse_mode="Markdown", reply_markup=kb_working())
 
-# ── Shared Actions ────────────────────────────────────────────
-async def handle_begin(uid: int, chat_id: int, app, reply_fn):
-    sess = get_sess(uid)
-    sess["chat_id"] = chat_id
-    if sess["status"] in ("working", "paused"):
-        await reply_fn(r(ALREADY_WORKING), kb_for(sess))
-        return
+def _to_tz(dt: datetime, tz: ZoneInfo) -> datetime:
+    return dt.astimezone(tz)
 
-    now = now_local()
-    sess["start_time"] = now
-    sess["milestones_sent"] = set()
 
-    # If it is lunch break (13:00 - 14:00), automatically set in pause mode!
-    if is_lunch_time(now) and not sess.get("lunch_override", False):
-        sess["status"] = "paused"
-        sess["auto_lunch_paused"] = True
-        sess["lunch_override"] = False
-        open_seg(sess, "break")
-        save_data()
-        start_job(app, uid, chat_id)
-        msg = (
-            f"🍱 *Clocked in at {fmt_t(now)}, but it's Lunch Break (13:00 – 14:00)!*\n"
-            f"🎯 Mission: *{fmt_dur(sess['goal_hours']*3600)}* of focused work!\n\n"
-            "Your timer has been automatically set to *Pause* ⏸️ so lunch time isn't counted as work.\n\n"
-            "It will automatically resume at *14:00*! Enjoy your meal! ☕🥪\n\n"
-            "_(If you're working through lunch today, tap Work Anyway below)_"
-        )
-        await reply_fn(msg, kb_lunch_paused())
-        return
+def _get_session_result(db, sess: WorkSession, sched: Optional[WorkSchedule], tz: ZoneInfo) -> CalcResult:
+    from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+    ls_h, ls_m = map(int, DEFAULT_LUNCH_START.split(":"))
+    le_h, le_m = map(int, DEFAULT_LUNCH_END.split(":"))
+    return _calc_session(sess, sched, tz, time(ls_h, ls_m), time(le_h, le_m))
 
-    sess["status"] = "working"
-    sess["auto_lunch_paused"] = False
-    open_seg(sess, "work")
-    save_data()
-    start_job(app, uid, chat_id)
-    await reply_fn(
-        r(BEGIN).format(t=fmt_t(sess["start_time"]), goal=fmt_dur(sess["goal_hours"]*3600)),
-        kb_working()
-    )
 
-async def handle_reset(uid: int, chat_id: int, app, reply_fn):
-    stop_job(app, uid)
-    sess = reset_session(uid, chat_id)
-    goal_str = f"{sess['goal_hours']:g}h"
-    msgs = [
-        f"🔄 *All clear! Fresh slate!*\n🎯 Goal kept at: *{goal_str}*\n\nHit *▶️ Start Working* when you're ready to go! 🌅",
-        f"✨ *Reset done!* Timeline cleared, goal kept at *{goal_str}*!\n\nPress *▶️ Start Working* to begin! 💪",
-        f"🌱 *Starting fresh!* Tap *▶️ Start Working* when you're ready! 🚀",
+def _is_working_day_today(db, user: User) -> tuple[bool, Optional[WorkSchedule], Optional[object]]:
+    tz = _user_tz(user)
+    today = _now_local(tz).date()
+    holiday = is_holiday(db, user.id, today)
+    sched = get_schedule_for_weekday(db, user.id, today.weekday())
+    is_work = sched is not None and sched.is_working_day and holiday is None
+    return is_work, sched, holiday
+
+
+# ── Status card ─────────────────────────────────────────────────
+
+def _status_card(sess: WorkSession, result: CalcResult, tz: ZoneInfo, sched: Optional[WorkSchedule]) -> str:
+    from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+
+    status = sess.status
+    if status == "active":
+        status_line = "🟢  *WORKING*"
+    elif status == "lunch":
+        status_line = "🟡  *LUNCH BREAK*"
+    elif status == "paused":
+        status_line = "⚪  *ON A BREAK*"
+    elif status == "done":
+        status_line = "🔴  *FINISHED*"
+    else:
+        status_line = "⚫  *IDLE*"
+
+    started_local = _to_tz(sess.started_at, tz)
+
+    lines = [
+        status_line,
+        "",
+        f"🕐  Started:      *{fmt_t(started_local)}*",
+        f"⏱  Worked:       *{fmt_dur(result.worked_secs)}*",
+        f"🎯  Goal:         *{fmt_dur(result.required_secs)}*",
+        f"⏳  Remaining:    *{fmt_dur(result.remaining_secs)}*",
     ]
-    await reply_fn(r(msgs), kb_idle())
 
-# ── Command handlers ──────────────────────────────────────────
+    if result.mandatory_secs > 60:
+        lines.append(f"🍱  Lunch break:  *{fmt_dur(result.mandatory_secs)}*")
+    if result.manual_secs > 30:
+        lines.append(f"☕  Other breaks: *{fmt_dur(result.manual_secs)}*")
+
+    lines += [
+        "",
+        "─" * 16,
+        pbar(result.pct),
+        "─" * 16,
+    ]
+
+    if status == "lunch":
+        lines += [
+            "",
+            f"🍱  *Lunch break: {DEFAULT_LUNCH_START} – {DEFAULT_LUNCH_END}*",
+            f"_Your timer is paused. Resumes automatically at {DEFAULT_LUNCH_END}._ ⏰",
+        ]
+    elif status == "active" and result.projected_done_at:
+        done_local = _to_tz(result.projected_done_at, tz)
+        lines += [
+            "",
+            f"🏁  Est. finish:  *{fmt_t(done_local)}*",
+        ]
+    elif status == "paused":
+        lines += [
+            "",
+            "_Timer paused. Tap ▶️ Resume whenever you're ready!_",
+        ]
+
+    if result.is_complete:
+        overtime = result.worked_secs - result.required_secs
+        ot_str = f"  _(+{fmt_dur(overtime)} overtime 🌟)_" if overtime > 60 else ""
+        lines += ["", f"🎉  *Goal achieved!*{ot_str}"]
+
+    return "\n".join(lines)
+
+
+# ── Timeline text ──────────────────────────────────────────────
+
+def _timeline_text(sess: WorkSession, tz: ZoneInfo) -> str:
+    if not sess.breaks:
+        started_local = _to_tz(sess.started_at, tz)
+        ended_local   = _to_tz(sess.ended_at, tz) if sess.ended_at else None
+        end_str = fmt_t(ended_local) if ended_local else "now ←"
+        return f"*📅 Timeline*\n\n💼  {fmt_t(started_local)} → {end_str}"
+
+    lines = ["*📅 Timeline*", ""]
+    # Build segments from breaks
+    breaks_sorted = sorted(sess.breaks, key=lambda b: b.started_at)
+    cursor = _to_tz(sess.started_at, tz)
+
+    for brk in breaks_sorted:
+        b_start = _to_tz(brk.started_at, tz)
+        b_end   = _to_tz(brk.ended_at, tz) if brk.ended_at else None
+        if b_start > cursor:
+            dur = (b_start - cursor).total_seconds()
+            lines.append(f"💼  {fmt_t(cursor)} → {fmt_t(b_start)}  _({fmt_dur(dur)})_")
+        icon = "🍱" if brk.break_type == "lunch" else "☕"
+        end_str = fmt_t(b_end) if b_end else "now ←"
+        if b_end:
+            dur = (b_end - b_start).total_seconds()
+            lines.append(f"{icon}  {fmt_t(b_start)} → {end_str}  _({fmt_dur(dur)})_")
+        else:
+            lines.append(f"{icon}  {fmt_t(b_start)} → now ← (ongoing)")
+        cursor = b_end or _now_local(tz)
+
+    session_end = _to_tz(sess.ended_at, tz) if sess.ended_at else None
+    if cursor < (session_end or _now_local(tz)):
+        end_str = fmt_t(session_end) if session_end else "now ←"
+        dur = ((session_end or _now_local(tz)) - cursor).total_seconds()
+        lines.append(f"💼  {fmt_t(cursor)} → {end_str}  _({fmt_dur(dur)})_")
+
+    return "\n".join(lines)
+
+
+# ── Begin session logic ─────────────────────────────────────────
+
+async def _do_begin(
+    uid: int, chat_id: int, app: Application,
+    reply_fn, extra: bool = False,
+):
+    db = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        tz   = _user_tz(user)
+        now  = _now_local(tz)
+        today = now.date()
+
+        # Check for existing active session
+        existing = get_active_session(db, user.id, today)
+        if existing and existing.status != "done":
+            sched2  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result2 = _get_session_result(db, existing, sched2, tz)
+            await reply_fn(
+                f"🟢 *You're already clocked in!*\n\n"
+                f"⏱ Worked so far: *{fmt_dur(result2.worked_secs)}*  ·  ⏳ Left: *{fmt_dur(result2.remaining_secs)}*\n\n"
+                f"Use the buttons below to take a break, check your progress, or finish your day.",
+                kb_for_session(existing),
+            )
+            return
+
+        is_work, sched, holiday = _is_working_day_today(db, user)
+
+        if not extra and not is_work:
+            if holiday:
+                reason = f" \u2014 *{holiday.reason}*" if holiday.reason else ""
+                day_label = (
+                    f"🗓 *Day off: {today.strftime('%B %d, %Y')}*{reason}\n\n"
+                    f"This date is marked as a holiday in your calendar.\n"
+                    f"Reminders and work tracking are paused for today."
+                )
+            else:
+                day_label = (
+                    f"🛠 *Today is {WEEKDAY_NAMES[today.weekday()]}*\n\n"
+                    f"According to your schedule, this is a day off.\n"
+                    f"No need to work today — but I understand if you want to anyway! 😉"
+                )
+            await reply_fn(
+                f"{day_label}\n\n"
+                f"────────────────────\n"
+                f"If you'd like to log extra work today, it will be tracked separately as *Weekend / Extra Work*.",
+                kb_nonworking(),
+            )
+            return
+
+        now_utc = _to_utc(now)
+
+        sess = WorkSession(
+            user_id=user.id,
+            date=today,
+            started_at=now_utc,
+            ended_at=None,
+            status="active",
+            session_type="extra" if extra else "normal",
+            chat_id=chat_id,
+        )
+        db.add(sess)
+        db.commit()
+
+        required_hours = (sched.required_hours if sched and sched.required_hours else user.goal_hours)
+        goal_secs = required_hours * 3600
+
+        # Check if starting during lunch window
+        from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+        ls_h, ls_m = map(int, DEFAULT_LUNCH_START.split(":"))
+        le_h, le_m = map(int, DEFAULT_LUNCH_END.split(":"))
+        in_lunch = time(ls_h, ls_m) <= now.time() < time(le_h, le_m)
+
+        if in_lunch:
+            brk = Break(session_id=sess.id, started_at=now_utc, ended_at=None, break_type="lunch")
+            db.add(brk)
+            sess.status = "lunch"
+            db.commit()
+            start_safety_net(app, user.telegram_id, chat_id)
+            schedule_daily_jobs(app, user.id, chat_id, tz)
+            await reply_fn(
+                f"🟡 *Clocked in at {fmt_t(now)} — right at lunch time!*\n\n"
+                f"🎯 Goal today: *{fmt_dur(goal_secs)}*\n"
+                f"🍱 Lunch break runs until *{DEFAULT_LUNCH_END}*\n\n"
+                f"Your timer is *paused automatically* — lunch won't count as work. ✔️\n"
+                f"I'll resume your clock at *{DEFAULT_LUNCH_END}* automatically. ⏰\n\n"
+                f"_Want to work through lunch? Tap the button below._",
+                kb_lunch(),
+            )
+            return
+
+        # Start normally
+        start_safety_net(app, user.telegram_id, chat_id)
+        schedule_daily_jobs(app, user.id, chat_id, tz)
+
+        # Schedule done job
+        result = _get_session_result(db, sess, sched, tz)
+        if result.projected_done_at:
+            schedule_done_job(app, user.id, chat_id, tz, result.projected_done_at)
+
+        extra_tag = "\n\n🚀 _This session is logged as Extra Work — have a great day!_" if extra else ""
+        await reply_fn(
+            r(BEGIN_MSGS).format(t=fmt_t(now), goal=fmt_dur(goal_secs)) + extra_tag,
+            kb_working(),
+        )
+    finally:
+        db.close()
+
+
+# ── Command handlers ───────────────────────────────────────────
+
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sess = get_sess(u.effective_user.id)
-    sess["chat_id"] = u.effective_chat.id
-    save_data()
-    name = u.effective_user.first_name or "there"
-    greeting = r(GREET).format(name=name)
-    goal_str = f"{sess['goal_hours']:g} hours"
-    await u.message.reply_text(
-        f"{greeting}\n\n"
-        f"I'm *WorkBot* — your personal daily hours tracker! Here's what I do:\n\n"
-        f"⏱ Track work sessions with *pause & resume*\n"
-        f"🍱 *Auto-pause for lunch break* from 13:00 to 14:00\n"
-        f"📈 *Weekly & Monthly Reports* with 1-click buttons\n"
-        f"📊 Show live progress with a full timeline\n"
-        f"🎉 *Auto-notify you* the moment you hit your goal\n"
-        f"🔥 Send milestone cheers at 25%, 50%, 75%\n\n"
-        f"🎯 Current goal: *{goal_str}*  _(tap 🎯 Set Goal to change)_\n\n"
-        f"Hit *▶️ Start Working* whenever you're ready! 💪",
-        parse_mode="Markdown", reply_markup=kb_for(sess)
-    )
+    uid = u.effective_user.id
+    chat_id = u.effective_chat.id
+    db = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        tz   = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+        name  = u.effective_user.first_name or "there"
+
+        sched = get_schedule_for_weekday(db, user.id, today.weekday())
+        start_str = sched.start_time.strftime("%H:%M") if sched and sched.start_time else "09:00"
+        end_str   = sched.end_time.strftime("%H:%M")   if sched and sched.end_time   else "18:00"
+
+        if sess and sess.status != "done":
+            # Already in a session — show status directly
+            sched2  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result  = _get_session_result(db, sess, sched2, tz)
+            card    = _status_card(sess, result, tz, sched2)
+            await u.message.reply_text(
+                f"👋 *Hey {name}!* Here's where you stand today:\n\n" + card,
+                parse_mode="Markdown",
+                reply_markup=kb_for_session(sess),
+            )
+            return
+
+        kb = kb_for_session(sess) if sess else kb_idle()
+        await u.message.reply_text(
+            f"👋 *Hey {name}! Welcome to WorkBot* 🤖\n\n"
+            f"I'm your personal work-time tracker. I keep an accurate record of every "
+            f"minute you work — and I'll never let a lunch break sneak into your hours.\n\n"
+            f"*What I do for you:*\n"
+            f"⏱  Track work sessions with *pause & resume*\n"
+            f"🍱  *Auto-pause* at 13:00 lunch, *auto-resume* at 14:00\n"
+            f"🎯  Alert you the *exact second* your daily goal is hit\n"
+            f"📊  *Weekly & monthly* work reports\n"
+            f"📤  *Export* to CSV or Excel in one tap\n"
+            f"✏️  Correct any mistake (*edit* start, end, or breaks)\n"
+            f"🗓  *Holidays & days off* — no nagging on your time off\n\n"
+            f"─────────────────────\n"
+            f"🎯  Daily goal:  *{user.goal_hours:g}h*"
+            f"  ·  🕐  Schedule: *{start_str}–{end_str}*\n"
+            f"─────────────────────\n\n"
+            f"Tap *▶️ Start Working* when you're ready! 💪",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    finally:
+        db.close()
+
 
 async def cmd_begin(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async def reply(text, kb):
         await u.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    await handle_begin(u.effective_user.id, u.effective_chat.id, ctx.application, reply)
+    await _do_begin(u.effective_user.id, u.effective_chat.id, ctx.application, reply)
+
 
 async def cmd_pause(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sess = get_sess(u.effective_user.id)
-    if sess["status"] == "paused":
-        await u.message.reply_text(r(ALREADY_PAUSED), parse_mode="Markdown", reply_markup=kb_for(sess))
-        return
-    if sess["status"] != "working":
-        await u.message.reply_text(r(NOT_WORKING), parse_mode="Markdown", reply_markup=kb_for(sess))
-        return
-    open_seg(sess, "break")
-    sess["status"] = "paused"
-    if is_lunch_time():
-        sess["auto_lunch_paused"] = True
-    save_data()
-    s = calc(sess)
-    await u.message.reply_text(
-        r(PAUSE).format(t=fmt_t(now_local()), worked=fmt_dur(s["worked"])),
-        parse_mode="Markdown", reply_markup=kb_for(sess)
-    )
+    uid = u.effective_user.id
+    db = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        tz   = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+
+        if not sess or sess.status == "done":
+            await u.message.reply_text(
+                "👀 *No active session.*\n\nStart one first — tap the button below!",
+                parse_mode="Markdown", reply_markup=kb_idle(),
+            )
+            return
+        if sess.status in ("paused", "lunch"):
+            await u.message.reply_text(
+                "⏸ *You're already on a break!*\n\nTap *▶️ Resume Working* when you're back. ☕",
+                parse_mode="Markdown", reply_markup=kb_for_session(sess),
+            )
+            return
+        if sess.status != "active":
+            await u.message.reply_text(
+                "🤔 Nothing to pause right now.",
+                parse_mode="Markdown", reply_markup=kb_for_session(sess),
+            )
+            return
+
+        now_utc = _now_utc()
+        brk = Break(session_id=sess.id, started_at=now_utc, break_type="manual")
+        db.add(brk)
+        sess.status = "paused"
+        db.commit()
+
+        cancel_done_job(ctx.application, user.id)
+        sched = get_schedule_for_weekday(db, user.id, today.weekday())
+        result = _get_session_result(db, sess, sched, tz)
+        await u.message.reply_text(
+            r(PAUSE_MSGS).format(t=fmt_t(_now_local(tz)), worked=fmt_dur(result.worked_secs)),
+            parse_mode="Markdown",
+            reply_markup=kb_paused(),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_resume(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
-    sess = get_sess(uid)
-    if sess["status"] == "working":
-        await u.message.reply_text(r(NOT_ON_BREAK), parse_mode="Markdown", reply_markup=kb_for(sess))
-        return
-    if sess["status"] != "paused":
-        await u.message.reply_text(r(NOT_WORKING), parse_mode="Markdown", reply_markup=kb_for(sess))
-        return
-    if is_lunch_time():
-        sess["lunch_override"] = True
-    sess["auto_lunch_paused"] = False
-    open_seg(sess, "work")
-    sess["status"] = "working"
-    save_data()
-    s = calc(sess)
-    start_job(ctx.application, uid, u.effective_chat.id)
-    await u.message.reply_text(
-        r(RESUME).format(t=fmt_t(now_local()), worked=fmt_dur(s["worked"]),
-                         left=fmt_dur(s["remaining"]), bar=pbar(s["pct"])),
-        parse_mode="Markdown", reply_markup=kb_working()
-    )
+    db = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        tz   = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+
+        if not sess or sess.status == "done":
+            await u.message.reply_text(
+                "👀 *No active session.*\n\nStart one first — tap below!",
+                parse_mode="Markdown", reply_markup=kb_idle(),
+            )
+            return
+        if sess.status == "active":
+            await u.message.reply_text(
+                "💼 *You're already working!*\n\nNeed a break? Tap *⏸ Take a Break*.",
+                parse_mode="Markdown", reply_markup=kb_working(),
+            )
+            return
+        if sess.status not in ("paused", "lunch"):
+            await u.message.reply_text(
+                "🤔 Nothing to resume right now.",
+                parse_mode="Markdown", reply_markup=kb_for_session(sess),
+            )
+            return
+
+        # Close open break
+        open_brk = get_open_break(db, sess.id)
+        if open_brk:
+            open_brk.ended_at = _now_utc()
+        sess.status = "active"
+        db.commit()
+
+        sched = get_schedule_for_weekday(db, user.id, today.weekday())
+        result = _get_session_result(db, sess, sched, tz)
+        if result.projected_done_at:
+            schedule_done_job(ctx.application, user.id, u.effective_chat.id, tz, result.projected_done_at)
+
+        await u.message.reply_text(
+            r(RESUME_MSGS).format(
+                t=fmt_t(_now_local(tz)),
+                worked=fmt_dur(result.worked_secs),
+                left=fmt_dur(result.remaining_secs),
+                bar=pbar(result.pct),
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb_working(),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sess = get_sess(u.effective_user.id)
-    if sess["status"] == "idle":
-        await u.message.reply_text(r(NO_SESSION), parse_mode="Markdown", reply_markup=kb_idle())
-        return
-    text = status_card(sess) + "\n\n" + timeline_text(sess)
-    await u.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_for(sess))
+    uid = u.effective_user.id
+    db = get_db()
+    try:
+        user  = get_or_create_user(db, uid)
+        tz    = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+
+        if not sess:
+            await u.message.reply_text(
+                "👋 *No session started today.*\n\nHit *▶️ Start Working* whenever you're ready!",
+                parse_mode="Markdown", reply_markup=kb_idle(),
+            )
+            return
+
+        sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+        result = _get_session_result(db, sess, sched, tz)
+        card   = _status_card(sess, result, tz, sched)
+        tl     = _timeline_text(sess, tz)
+        await u.message.reply_text(
+            card + "\n\n" + tl,
+            parse_mode="Markdown",
+            reply_markup=kb_for_session(sess),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_done(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
-    sess = get_sess(uid)
-    if sess["status"] == "idle":
-        await u.message.reply_text(r(NO_SESSION), parse_mode="Markdown", reply_markup=kb_idle())
-        return
-    stop_job(ctx.application, uid)
-    close_seg(sess)
-    sess["status"] = "done"
-    record_day_history(uid)
-    save_data()
-    s = calc(sess)
-    tl = timeline_text(sess)
-    kw = dict(start=fmt_t(sess["start_time"]), end=fmt_t(now_local()),
-              worked=fmt_dur(s["worked"]), rest=fmt_dur(s["resting"]),
-              goal=fmt_dur(s["goal"]), bar=pbar(s["pct"]), timeline=tl)
-    msg = r(DONE_GOAL).format(**kw) if s["remaining"] == 0 else r(DONE_PARTIAL).format(**kw)
-    await u.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb_done())
+    db = get_db()
+    try:
+        user  = get_or_create_user(db, uid)
+        tz    = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+
+        if not sess:
+            await u.message.reply_text(
+                "👋 *No active session to stop.*\n\nStart one below!",
+                parse_mode="Markdown", reply_markup=kb_idle(),
+            )
+            return
+
+        now_utc = _now_utc()
+        open_brk = get_open_break(db, sess.id)
+        if open_brk:
+            open_brk.ended_at = now_utc
+        sess.status = "done"
+        sess.ended_at = now_utc
+        db.commit()
+
+        stop_safety_net(ctx.application, user.id)
+        cancel_done_job(ctx.application, user.id)
+
+        sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+        result = _get_session_result(db, sess, sched, tz)
+        card   = _status_card(sess, result, tz, sched)
+        tl     = _timeline_text(sess, tz)
+
+        if result.is_complete:
+            overtime = result.worked_secs - result.required_secs
+            ot_str = f"\n🌟 Overtime: *{fmt_dur(overtime)}* — above and beyond!" if overtime > 60 else ""
+            congrats = (
+                f"🎉 *Day complete! Outstanding work!*\n"
+                f"You hit your *{fmt_dur(result.required_secs)}* goal.{ot_str}\n\n"
+            )
+        else:
+            congrats = "🏁 *Session closed.*\n\nEvery minute counts. See you next time! 💙\n\n"
+        await u.message.reply_text(
+            congrats + card + "\n\n" + tl,
+            parse_mode="Markdown",
+            reply_markup=kb_done(),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_reset(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    async def reply(text, kb):
-        await u.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    await handle_reset(u.effective_user.id, u.effective_chat.id, ctx.application, reply)
+    uid = u.effective_user.id
+    db = get_db()
+    try:
+        user  = get_or_create_user(db, uid)
+        tz    = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+
+        stop_safety_net(ctx.application, user.id)
+        cancel_done_job(ctx.application, user.id)
+
+        if sess:
+            now_utc = _now_utc()
+            open_brk = get_open_break(db, sess.id)
+            if open_brk:
+                open_brk.ended_at = now_utc
+            sess.status = "done"
+            if not sess.ended_at:
+                sess.ended_at = now_utc
+            db.commit()
+
+        msgs = [
+            "🔄 *All clear!* Today's session has been reset.\n\nWhenever you're ready, tap *▶️ Start Working* to begin fresh! 🌅",
+            "✨ *Fresh start!* Session cleared.\n\nHit *▶️ Start Working* when you're ready to go! 💪",
+            "🌱 *Reset done!* Timeline cleared, goal kept.\n\nPress *▶️ Start Working* to begin! 🚀",
+        ]
+        await u.message.reply_text(
+            random.choice(msgs),
+            parse_mode="Markdown",
+            reply_markup=kb_idle(),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_report(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = u.effective_user.id
-    if ctx.args:
-        arg = ctx.args[0].lower()
-        if "week" in arg:
-            await u.message.reply_text(get_weekly_report(uid), parse_mode="Markdown", reply_markup=kb_report_view("week"))
-            return
-        elif "month" in arg:
-            await u.message.reply_text(get_monthly_report(uid), parse_mode="Markdown", reply_markup=kb_report_view("month"))
-            return
     await u.message.reply_text(
-        "📊 *Work Reports & Statistics*\n\n"
-        "Choose a timeframe to view your progress:",
+        "📊 *Work Reports*\n\nHere's a summary of your hours. Choose a timeframe:",
         parse_mode="Markdown",
-        reply_markup=kb_reports_menu()
+        reply_markup=kb_reports_menu(),
     )
 
-# ── /setgoal conversation ─────────────────────────────────────
+
+async def cmd_export(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "📤 *Export Work History*\n\nChoose your format and time range — I'll prepare the file instantly:",
+        parse_mode="Markdown",
+        reply_markup=kb_export_menu(),
+    )
+
+
+async def cmd_holiday(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "🗓 *Holidays & Days Off*\n\nAdd dates when you're not working — I'll skip reminders and stop expecting work on those days.",
+        parse_mode="Markdown",
+        reply_markup=kb_holiday_menu(),
+    )
+
+
+# ── /setgoal conversation ──────────────────────────────────────
+
 async def cmd_setgoal(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if ctx.args:
         return await _apply_goal(u, ctx, ctx.args[0])
     await u.message.reply_text(
-        "🎯 *What's your working goal for today?*\n\nJust type a number — like `6`, `7.5`, or `8` hours:",
-        parse_mode="Markdown"
+        "🎯 *Set your daily work goal*\n\nHow many hours do you aim to work each day?\nJust type a number like `6`, `7.5`, or `8`:",
+        parse_mode="Markdown",
     )
     return ASK_GOAL
 
-async def goal_received(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def _goal_received(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return await _apply_goal(u, ctx, u.message.text)
+
 
 async def _apply_goal(u: Update, ctx: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
     try:
@@ -869,201 +765,724 @@ async def _apply_goal(u: Update, ctx: ContextTypes.DEFAULT_TYPE, raw: str) -> in
         assert 0 < hours <= 24
     except (ValueError, AssertionError):
         await u.message.reply_text(
-            "🤔 Hmm, that doesn't look like a valid number.\nTry something like `6`, `7.5`, or `8` 😊",
-            parse_mode="Markdown"
+            "🤔 *Hmm, that doesn't look right.*\n\nPlease enter a number between 1 and 24, like `6`, `7.5`, or `8`.",
+            parse_mode="Markdown",
         )
         return ASK_GOAL
+
     uid = u.effective_user.id
-    save_user_goal(uid, hours)
-    sess = get_sess(uid)
-    sess["goal_hours"] = hours
-    save_data()
-    msgs = [
-        f"✅ *Goal set to {hours:g} hours!* Love the ambition! 🎯\n\nI'll celebrate every milestone and shout when you nail it! 🎉",
-        f"🎯 *{hours:g} hours — let's go!* Goal locked in!\n\nI'll be cheering you on the whole way! 💪",
-        f"✨ *Perfect!* {hours:g}-hour goal saved!\n\nExpect milestone updates and a big celebration when you finish! 🏆",
+    db  = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        user.goal_hours = hours
+        # Update all working-day schedules
+        for sched in user.schedules:
+            if sched.is_working_day:
+                sched.required_hours = hours
+        db.commit()
+    finally:
+        db.close()
+
+    goal_msgs = [
+        f"✅ *Goal locked in: {hours:g}h per day!*\n\nI'll celebrate every milestone and shout the moment you hit it! 🎉",
+        f"🎯 *{hours:g} hours — let's go!* Goal saved.\n\nExpect milestone cheers at 25%, 50%, 75%, and a big 🎉 when you finish!",
+        f"✨ *Perfect!* Daily goal set to *{hours:g}h*.\n\nI'll track every minute and notify you right when you're done! 🏆",
     ]
-    await u.message.reply_text(r(msgs), parse_mode="Markdown", reply_markup=kb_for(sess))
+    await u.message.reply_text(
+        random.choice(goal_msgs),
+        parse_mode="Markdown",
+        reply_markup=kb_idle(),
+    )
     return ConversationHandler.END
 
-async def cancel_conv(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await u.message.reply_text("No worries, cancelled! 👍 Let me know if you need anything.")
+
+async def _cancel_conv(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await u.message.reply_text(
+        "No problem! Cancelled. 👍",
+        reply_markup=kb_idle(),
+    )
     return ConversationHandler.END
 
-# ── Inline buttons ────────────────────────────────────────────
+
+# ── /edit conversation ─────────────────────────────────────────
+
+async def cmd_edit(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "✏️ *Correct your session*\n\nMade a mistake? No worries — pick what you'd like to fix:",
+        parse_mode="Markdown",
+        reply_markup=kb_edit_menu(),
+    )
+
+
+# ── Report helpers ─────────────────────────────────────────────
+
+def _weekly_report(db, user: User, tz: ZoneInfo) -> str:
+    today = _now_local(tz).date()
+    start_of_week = today - timedelta(days=today.weekday())
+    end_of_week   = start_of_week + timedelta(days=6)
+    sessions = get_sessions_for_range(db, user.id, start_of_week, today)
+
+    from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+    ls_h, ls_m = map(int, DEFAULT_LUNCH_START.split(":"))
+    le_h, le_m = map(int, DEFAULT_LUNCH_END.split(":"))
+
+    total_worked = 0.0
+    days_worked  = 0
+    goals_met    = 0
+
+    by_date: dict[date, WorkSession] = {}
+    for s in sessions:
+        if s.date not in by_date or s.started_at < by_date[s.date].started_at:
+            by_date[s.date] = s
+
+    day_lines = []
+    weekly_target = 0.0
+    for i in range(7):
+        d = start_of_week + timedelta(days=i)
+        sched = get_schedule_for_weekday(db, user.id, d.weekday())
+        req = sched.required_hours if sched and sched.required_hours else user.goal_hours
+        if sched and sched.is_working_day:
+            weekly_target += req * 3600
+
+        sess = by_date.get(d)
+        if sess:
+            result = _calc_session(sess, sched, tz, time(ls_h, ls_m), time(le_h, le_m))
+            total_worked += result.worked_secs
+            days_worked  += 1
+            if result.is_complete:
+                goals_met += 1
+                badge = "✅"
+            else:
+                badge = "⏳" if d == today else "⚡"
+            day_lines.append(f"• *{WEEKDAY_NAMES[i][:3]}, {d.strftime('%b %d')}:* {fmt_dur(result.worked_secs)} {badge}")
+        else:
+            if d > today:
+                day_lines.append(f"• *{WEEKDAY_NAMES[i][:3]}, {d.strftime('%b %d')}:* —")
+            elif sched and sched.is_working_day:
+                day_lines.append(f"• *{WEEKDAY_NAMES[i][:3]}, {d.strftime('%b %d')}:* 0m")
+            else:
+                day_lines.append(f"• *{WEEKDAY_NAMES[i][:3]}, {d.strftime('%b %d')}:* _day off_")
+
+    pct = min(100, int(total_worked / weekly_target * 100)) if weekly_target else 0
+    avg = total_worked / days_worked if days_worked else 0
+
+    return "\n".join([
+        f"📊 *Weekly Report* ({start_of_week.strftime('%b %d')} – {end_of_week.strftime('%b %d')})",
+        "",
+        f"⏱ Total Worked: *{fmt_dur(total_worked)}*",
+        f"🎯 Weekly Target: *{fmt_dur(weekly_target)}* ({pct}%)",
+        f"📈 Daily Average: *{fmt_dur(avg)}*",
+        f"🏆 Goals Hit: *{goals_met}/{max(days_worked, 1)} working days*",
+        "",
+        pbar(pct),
+        "",
+        "*📅 Daily Breakdown:*",
+        *day_lines,
+    ])
+
+
+def _monthly_report(db, user: User, tz: ZoneInfo) -> str:
+    today = _now_local(tz).date()
+    from calendar import monthrange
+    year, month = today.year, today.month
+    start_of_month = date(year, month, 1)
+    sessions = get_sessions_for_range(db, user.id, start_of_month, today)
+
+    from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+    ls_h, ls_m = map(int, DEFAULT_LUNCH_START.split(":"))
+    le_h, le_m = map(int, DEFAULT_LUNCH_END.split(":"))
+
+    total_worked = 0.0
+    days_worked  = 0
+    goals_met    = 0
+
+    for sess in sessions:
+        sched = get_schedule_for_weekday(db, user.id, sess.date.weekday())
+        result = _calc_session(sess, sched, tz, time(ls_h, ls_m), time(le_h, le_m))
+        total_worked += result.worked_secs
+        days_worked  += 1
+        if result.is_complete:
+            goals_met += 1
+
+    avg         = total_worked / days_worked if days_worked else 0
+    success_pct = int(goals_met / days_worked * 100) if days_worked else 0
+
+    return "\n".join([
+        f"📆 *Monthly Report* ({today.strftime('%B %Y')})",
+        "",
+        f"⏱ Total Worked: *{fmt_dur(total_worked)}*",
+        f"💼 Active Days: *{days_worked}*",
+        f"📈 Average/Day: *{fmt_dur(avg)}*",
+        f"🎯 Goals Hit: *{goals_met}/{days_worked}* ({success_pct}%)",
+        f"⭐ Daily Goal: *{fmt_dur(user.goal_hours * 3600)}*",
+    ])
+
+
+# ── Export helpers ─────────────────────────────────────────────
+
+async def _send_export(bot, chat_id: int, uid: int, fmt: str, period: str):
+    from exporter import export_csv, export_excel
+    db = get_db()
+    try:
+        user  = get_or_create_user(db, uid)
+        tz    = _user_tz(user)
+        today = _now_local(tz).date()
+
+        if period == "today":
+            start, end = today, today
+        elif period == "week":
+            start = today - timedelta(days=today.weekday())
+            end   = today
+        elif period == "month":
+            start = today.replace(day=1)
+            end   = today
+        else:
+            start, end = today, today
+
+        filename_period = period.capitalize()
+        if fmt == "csv":
+            data = export_csv(db, user, start, end)
+            filename = f"WorkBot_{filename_period}_{today}.csv"
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(data, filename=filename),
+                caption=f"📄 Work history – {filename_period}\n_{start} → {end}_",
+                parse_mode="Markdown",
+            )
+        else:
+            data = export_excel(db, user, start, end)
+            filename = f"WorkBot_{filename_period}_{today}.xlsx"
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(data, filename=filename),
+                caption=f"📊 Work history – {filename_period}\n_{start} → {end}_",
+                parse_mode="Markdown",
+            )
+    finally:
+        db.close()
+
+
+# ── Inline button handler ──────────────────────────────────────
+
 async def on_button(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
-    uid = u.effective_user.id
+    uid     = u.effective_user.id
     chat_id = u.effective_chat.id
-    sess = get_sess(uid)
-    sess["chat_id"] = chat_id
+    data    = q.data
 
-    async def say(text: str, kb=None):
-        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb or kb_for(sess))
+    db = get_db()
+    try:
+        user  = get_or_create_user(db, uid)
+        user.id  # ensure loaded
+        tz    = _user_tz(user)
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
 
-    async def edit(text: str, kb=None):
+        async def say(text: str, kb=None):
+            await q.message.reply_text(
+                text, parse_mode="Markdown",
+                reply_markup=kb or kb_for_session(sess),
+            )
+
+        async def edit(text: str, kb=None):
+            try:
+                await q.edit_message_text(
+                    text, parse_mode="Markdown",
+                    reply_markup=kb or kb_for_session(sess),
+                )
+            except BadRequest:
+                await say(text, kb)
+
+        # ── Begin ──
+        if data == "begin":
+            db.close()  # reopen inside _do_begin
+            async def reply(text, kb):
+                await say(text, kb)
+            await _do_begin(uid, chat_id, ctx.application, reply)
+            return
+
+        if data == "begin_extra":
+            db.close()
+            async def reply(text, kb):
+                await say(text, kb)
+            await _do_begin(uid, chat_id, ctx.application, reply, extra=True)
+            return
+
+        # ── Pause ──
+        if data == "pause":
+            if not sess or sess.status == "done":
+                await say("👀 *No active session.*\n\nStart one first — tap below!", kb_idle()); return
+            if sess.status in ("paused", "lunch"):
+                await say("⏸ *You're already on a break!*\n\nTap *▶️ Resume Working* when you're back. ☕"); return
+            if sess.status != "active":
+                await say("🤔 Nothing to pause right now."); return
+            now_utc = _now_utc()
+            brk = Break(session_id=sess.id, started_at=now_utc, break_type="manual")
+            db.add(brk)
+            sess.status = "paused"
+            db.commit()
+            cancel_done_job(ctx.application, user.id)
+            sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result = _get_session_result(db, sess, sched, tz)
+            await say(
+                r(PAUSE_MSGS).format(t=fmt_t(_now_local(tz)), worked=fmt_dur(result.worked_secs)),
+                kb_paused(),
+            )
+
+        # ── Resume ──
+        elif data == "resume":
+            if not sess: await say("👀 *No active session.*\n\nStart one first!", kb_idle()); return
+            if sess.status == "active": await say("💼 *You're already working!*\n\nNeed a break? Tap *⏸ Take a Break*.", kb_working()); return
+            if sess.status not in ("paused", "lunch"):
+                await say("🤔 Nothing to resume right now."); return
+            open_brk = get_open_break(db, sess.id)
+            if open_brk:
+                open_brk.ended_at = _now_utc()
+            sess.status = "active"
+            db.commit()
+            sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result = _get_session_result(db, sess, sched, tz)
+            if result.projected_done_at:
+                schedule_done_job(ctx.application, user.id, chat_id, tz, result.projected_done_at)
+            await say(
+                r(RESUME_MSGS).format(
+                    t=fmt_t(_now_local(tz)),
+                    worked=fmt_dur(result.worked_secs),
+                    left=fmt_dur(result.remaining_secs),
+                    bar=pbar(result.pct),
+                ),
+                kb_working(),
+            )
+
+        # ── Lunch override ──
+        elif data == "lunch_override":
+            if not sess: await say("👀 No session!", kb_idle()); return
+            open_brk = get_open_break(db, sess.id)
+            if open_brk:
+                open_brk.ended_at = _now_utc()
+            sess.status = "active"
+            db.commit()
+            sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result = _get_session_result(db, sess, sched, tz)
+            if result.projected_done_at:
+                schedule_done_job(ctx.application, user.id, chat_id, tz, result.projected_done_at)
+            await say(
+                "🟢 *Working through lunch — got it!*\n\n"
+                f"⏱ Worked: *{fmt_dur(result.worked_secs)}*  ·  ⏳ Left: *{fmt_dur(result.remaining_secs)}*\n\n"
+                f"{pbar(result.pct)}\n\nLunch break skipped. Timer is running! 💪",
+                kb_working(),
+            )
+
+        # ── Status ──
+        elif data == "status":
+            if not sess:
+                await say("👋 *No session today yet.*\n\nTap *▶️ Start Working* when you're ready!", kb_idle()); return
+            sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result = _get_session_result(db, sess, sched, tz)
+            card   = _status_card(sess, result, tz, sched)
+            tl     = _timeline_text(sess, tz)
+            await say(card + "\n\n" + tl)
+
+        # ── Done ──
+        elif data == "done":
+            if not sess: await say("👋 *No active session.*", kb_idle()); return
+            now_utc  = _now_utc()
+            open_brk = get_open_break(db, sess.id)
+            if open_brk:
+                open_brk.ended_at = now_utc
+            sess.status = "done"
+            sess.ended_at = now_utc
+            db.commit()
+            stop_safety_net(ctx.application, user.id)
+            cancel_done_job(ctx.application, user.id)
+            sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+            result = _get_session_result(db, sess, sched, tz)
+            card   = _status_card(sess, result, tz, sched)
+            tl     = _timeline_text(sess, tz)
+            if result.is_complete:
+                overtime = result.worked_secs - result.required_secs
+                ot_str = f"\n🌟 Overtime: *{fmt_dur(overtime)}* — above and beyond!" if overtime > 60 else ""
+                congrats = (
+                    f"🎉 *Day complete! Outstanding work!*\n"
+                    f"You hit your *{fmt_dur(result.required_secs)}* goal.{ot_str}\n\n"
+                )
+            else:
+                congrats = "🏁 *Session closed.*\n\nEvery minute counts. See you next time! 💙\n\n"
+            await say(congrats + card + "\n\n" + tl, kb_done())
+
+        # ── Reset ──
+        elif data == "reset":
+            stop_safety_net(ctx.application, user.id)
+            cancel_done_job(ctx.application, user.id)
+            if sess and sess.status != "done":
+                now_utc  = _now_utc()
+                open_brk = get_open_break(db, sess.id)
+                if open_brk:
+                    open_brk.ended_at = now_utc
+                sess.status = "done"
+                if not sess.ended_at:
+                    sess.ended_at = now_utc
+                db.commit()
+            await say(
+                random.choice([
+                    "🔄 *All clear!* Session reset.\nHit *▶️ Start Working* when you're ready! 🌅",
+                    "✨ *Fresh start!* Timeline cleared.\nTap *▶️ Start Working* to begin again! 💪",
+                    "🌱 *Reset done!* Ready for a new session.\nPress *▶️ Start Working* to go! 🚀",
+                ]),
+                kb_idle(),
+            )
+
+        # ── Set goal ──
+        elif data == "setgoal":
+            ctx.user_data["awaiting_goal"] = True
+            await say(
+                "🎯 *Set your daily work goal*\n\nHow many hours do you aim to work each day?\nJust type a number like `6`, `7.5`, or `8`:",
+                InlineKeyboardMarkup([]),
+            )
+
+        # ── Reports ──
+        elif data == "reports_menu":
+            await edit("📊 *Work Reports*\n\nHere's your work history at a glance. Choose a timeframe:", kb_reports_menu())
+
+        elif data == "report_week":
+            text = _weekly_report(db, user, tz)
+            await edit(text, kb_reports_menu())
+
+        elif data == "report_month":
+            text = _monthly_report(db, user, tz)
+            await edit(text, kb_reports_menu())
+
+        # ── Export ──
+        elif data == "export_menu":
+            await edit("📤 *Export Work History*\n\nChoose your format and period — I'll prepare the file instantly:", kb_export_menu())
+
+        elif data.startswith("export_"):
+            parts  = data.split("_")   # export_csv_today or export_xlsx_week
+            fmt    = parts[1]           # csv | xlsx
+            period = parts[2]           # today | week | month
+            period_label = {"today": "Today", "week": "This Week", "month": "This Month"}.get(period, period.capitalize())
+            await q.message.reply_text(
+                f"⏳ *Preparing your {fmt.upper()} file for {period_label}...*\n_This takes just a second!_",
+                parse_mode="Markdown",
+            )
+            await _send_export(ctx.bot, chat_id, uid, fmt, period)
+
+        # ── Edit menu ──
+        elif data == "edit_menu":
+            await say("✏️ *Correct your session*\n\nMade a mistake? No worries — pick what you'd like to fix:", kb_edit_menu())
+
+        elif data == "edit_start":
+            ctx.user_data["edit_action"] = "start"
+            await say(
+                "🕐 *Change Start Time*\n\nWhat time did you actually start?\nEnter it in *HH:MM* format (e.g. `09:20`):",
+                InlineKeyboardMarkup([]),
+            )
+
+        elif data == "edit_end":
+            ctx.user_data["edit_action"] = "end"
+            await say(
+                "🕔 *Change End Time*\n\nWhat time did you actually finish?\nEnter it in *HH:MM* format (e.g. `18:05`):",
+                InlineKeyboardMarkup([]),
+            )
+
+        elif data == "edit_add_break":
+            ctx.user_data["edit_action"] = "add_break"
+            await say(
+                "➕ *Add a Manual Break*\n\nEnter the break period in *HH:MM-HH:MM* format\n(e.g. `12:00-12:30` for a 30-minute break):",
+                InlineKeyboardMarkup([]),
+            )
+
+        elif data == "edit_delete":
+            if not sess:
+                await say("👀 *No session to delete.*\n\nStart one below!", kb_idle()); return
+            now_utc = _now_utc()
+            open_brk = get_open_break(db, sess.id)
+            if open_brk:
+                open_brk.ended_at = now_utc
+            sess.status = "done"
+            sess.ended_at = now_utc
+            db.commit()
+            stop_safety_net(ctx.application, user.id)
+            cancel_done_job(ctx.application, user.id)
+            await say(
+                "🗑 *Session deleted.*\n\nAll cleared! Start a fresh one whenever you're ready.",
+                kb_idle(),
+            )
+
+        # ── Holidays ──
+        elif data == "holiday_menu":
+            await edit(
+                "🗓 *Holidays & Days Off*\n\nAdd dates when you're not working — I'll skip reminders and stop expecting work on those days.",
+                kb_holiday_menu(),
+            )
+
+        elif data == "holiday_add":
+            ctx.user_data["awaiting_holiday_date"] = True
+            await say(
+                "🗓 *Add a Day Off*\n\nEnter the date you want to mark as non-working:\n*YYYY-MM-DD* format (e.g. `2026-12-25`):",
+                InlineKeyboardMarkup([]),
+            )
+
+        elif data == "holiday_list":
+            from db import Holiday as HolidayModel
+            holidays = (
+                db.query(HolidayModel)
+                .filter(HolidayModel.user_id == user.id)
+                .order_by(HolidayModel.date)
+                .all()
+            )
+            if not holidays:
+                await say(
+                    "📋 *No days off added yet.*\n\nTap *➕ Add Day Off* to mark holidays, vacations, or any other non-working days.",
+                    kb_holiday_menu(),
+                )
+            else:
+                lines = ["📋 *Your Days Off:*", ""]
+                for h in holidays:
+                    reason = f"  —  _{h.reason}_" if h.reason else ""
+                    lines.append(f"🗓 *{h.date.strftime('%b %d, %Y')}*{reason}")
+                lines += ["", f"_Total: {len(holidays)} day(s) off configured._"]
+                await say("\n".join(lines), kb_holiday_menu())
+
+        # ── Schedule view ──
+        elif data == "view_schedule":
+            lines = ["📅 *Your Work Schedule*", ""]
+            for wd in range(7):
+                sched = get_schedule_for_weekday(db, user.id, wd)
+                day_name = WEEKDAY_NAMES[wd]
+                if sched and sched.is_working_day:
+                    start_str = sched.start_time.strftime("%H:%M") if sched.start_time else "09:00"
+                    end_str   = sched.end_time.strftime("%H:%M")   if sched.end_time   else "18:00"
+                    req_str   = fmt_dur(sched.required_hours * 3600) if sched.required_hours else fmt_dur(user.goal_hours * 3600)
+                    lines.append(f"✅  *{day_name}:*  {start_str}–{end_str}  _({req_str} required)_")
+                else:
+                    lines.append(f"🛵  *{day_name}:*  Day off")
+            from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
+            lines += [
+                "",
+                f"🍱  Lunch break: *{DEFAULT_LUNCH_START}–{DEFAULT_LUNCH_END}* (automatic)",
+                f"🎯  Daily goal: *{fmt_dur(user.goal_hours * 3600)}*",
+            ]
+            await say("\n".join(lines), kb_for_session(sess))
+
+        # ── Back ──
+        elif data == "back_main":
+            if sess:
+                sched  = get_schedule_for_weekday(db, user.id, today.weekday())
+                result = _get_session_result(db, sess, sched, tz)
+                await edit(_status_card(sess, result, tz, sched), kb_for_session(sess))
+            else:
+                await edit(
+                    "👋 *Ready when you are!*\n\nTap *▶️ Start Working* to begin your day. 💪",
+                    kb_idle(),
+                )
+
+    finally:
         try:
-            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb or kb_for(sess))
-        except BadRequest:
+            db.close()
+        except Exception:
             pass
 
-    if q.data == "begin":
-        await handle_begin(uid, chat_id, ctx.application, say)
 
-    elif q.data == "pause":
-        if sess["status"] == "paused":
-            await say(r(ALREADY_PAUSED)); return
-        if sess["status"] != "working":
-            await say(r(NOT_WORKING)); return
-        open_seg(sess, "break")
-        sess["status"] = "paused"
-        if is_lunch_time():
-            sess["auto_lunch_paused"] = True
-        save_data()
-        s = calc(sess)
-        await say(r(PAUSE).format(t=fmt_t(now_local()), worked=fmt_dur(s["worked"])), kb_for(sess))
-
-    elif q.data == "resume":
-        if sess["status"] == "working":
-            await say(r(NOT_ON_BREAK)); return
-        if sess["status"] != "paused":
-            await say(r(NOT_WORKING)); return
-        if is_lunch_time():
-            sess["lunch_override"] = True
-        sess["auto_lunch_paused"] = False
-        open_seg(sess, "work")
-        sess["status"] = "working"
-        save_data()
-        s = calc(sess)
-        start_job(ctx.application, uid, chat_id)
-        await say(r(RESUME).format(t=fmt_t(now_local()), worked=fmt_dur(s["worked"]),
-                                   left=fmt_dur(s["remaining"]), bar=pbar(s["pct"])), kb_working())
-
-    elif q.data == "lunch_override":
-        sess["lunch_override"] = True
-        sess["auto_lunch_paused"] = False
-        open_seg(sess, "work")
-        sess["status"] = "working"
-        save_data()
-        s = calc(sess)
-        start_job(ctx.application, uid, chat_id)
-        await say(
-            "💼 *Work mode: ON!* Lunch break pause overridden.\n"
-            f"🎯 Goal: *{fmt_dur(sess['goal_hours']*3600)}* today!\n\n"
-            "I'm tracking your work — keep crushing it! 💪",
-            kb_working()
-        )
-
-    elif q.data == "status":
-        if sess["status"] == "idle":
-            await say(r(NO_SESSION), kb_idle()); return
-        await say(status_card(sess) + "\n\n" + timeline_text(sess))
-
-    elif q.data == "done":
-        if sess["status"] == "idle":
-            await say(r(NO_SESSION), kb_idle()); return
-        stop_job(ctx.application, uid)
-        close_seg(sess)
-        sess["status"] = "done"
-        record_day_history(uid)
-        save_data()
-        s = calc(sess)
-        tl = timeline_text(sess)
-        kw = dict(start=fmt_t(sess["start_time"]), end=fmt_t(now_local()),
-                  worked=fmt_dur(s["worked"]), rest=fmt_dur(s["resting"]),
-                  goal=fmt_dur(s["goal"]), bar=pbar(s["pct"]), timeline=tl)
-        msg = r(DONE_GOAL).format(**kw) if s["remaining"] == 0 else r(DONE_PARTIAL).format(**kw)
-        await say(msg, kb_done())
-
-    elif q.data == "setgoal":
-        ctx.user_data["awaiting_goal"] = True
-        await say("🎯 *What's your goal for today?*\n\nType a number like `6`, `7.5`, or `8`:",
-                  InlineKeyboardMarkup([]))
-
-    elif q.data == "reset":
-        await handle_reset(uid, chat_id, ctx.application, say)
-
-    # ── Report Callbacks ──────────────────────────────────────
-    elif q.data == "reports_menu":
-        await edit(
-            "📊 *Work Reports & Statistics*\n\n"
-            "Select a timeframe to view your progress:",
-            kb_reports_menu()
-        )
-
-    elif q.data == "report_week":
-        text = get_weekly_report(uid)
-        await edit(text, kb_report_view("week"))
-
-    elif q.data == "report_month":
-        text = get_monthly_report(uid)
-        await edit(text, kb_report_view("month"))
-
-    elif q.data == "reports_back":
-        if sess["status"] == "idle":
-            await edit("👋 Hit *▶️ Start Working* whenever you're ready! 💪", kb_idle())
-        elif sess["status"] == "done":
-            await edit("🏁 Today's session is wrapped! Ready for a new day?", kb_done())
-        else:
-            await edit(status_card(sess) + "\n\n" + timeline_text(sess), kb_for(sess))
+# ── Free text handler ──────────────────────────────────────────
 
 async def on_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if ctx.user_data.get("awaiting_goal"):
-        ctx.user_data.pop("awaiting_goal")
-        await _apply_goal(u, ctx, u.message.text)
-        return
-    sess = get_sess(u.effective_user.id)
-    if sess["status"] == "idle":
-        await u.message.reply_text(
-            "👋 Hey! Ready to start tracking your day? Hit the button below! 😊",
-            parse_mode="Markdown", reply_markup=kb_idle()
-        )
-    else:
-        tips = [
-            "💡 Need something? Try the buttons or /status, /pause, /resume, /done, /report",
-            "😊 Use the buttons below to control your session, or type /status to check progress!",
-            "👇 Everything you need is right in the buttons below!",
-        ]
-        await u.message.reply_text(r(tips), parse_mode="Markdown", reply_markup=kb_for(sess))
+    text = u.message.text or ""
+    uid  = u.effective_user.id
+    db   = get_db()
+    try:
+        user = get_or_create_user(db, uid)
+        tz   = _user_tz(user)
 
-# ── App Startup ───────────────────────────────────────────────
+        # ── Awaiting goal ──
+        if ctx.user_data.get("awaiting_goal"):
+            ctx.user_data.pop("awaiting_goal")
+            await _apply_goal(u, ctx, text)
+            return
+
+        # ── Awaiting holiday date ──
+        if ctx.user_data.get("awaiting_holiday_date"):
+            ctx.user_data.pop("awaiting_holiday_date")
+            try:
+                h_date = date.fromisoformat(text.strip())
+            except ValueError:
+                await u.message.reply_text(
+                    "❌ *Hmm, I don’t recognize that date.*\n\nPlease use *YYYY-MM-DD* format, e.g. `2026-12-25`.",
+                    parse_mode="Markdown",
+                )
+                return
+            ctx.user_data["holiday_date"] = h_date
+            ctx.user_data["awaiting_holiday_reason"] = True
+            await u.message.reply_text(
+                f"🗓 *{h_date.strftime('%B %d, %Y')}* — got it!\n\nAnything to label it with? (e.g. `National Holiday`, `Vacation`, `Company Holiday`)\nOr type *skip* to leave it blank:",
+                parse_mode="Markdown",
+            )
+            return
+
+        # ── Awaiting holiday reason ──
+        if ctx.user_data.get("awaiting_holiday_reason"):
+            ctx.user_data.pop("awaiting_holiday_reason")
+            h_date  = ctx.user_data.pop("holiday_date", None)
+            reason  = None if text.strip().lower() in ("skip", "-", "") else text.strip()
+            if h_date:
+                from db import Holiday as HolidayModel
+                from sqlalchemy.exc import IntegrityError
+                try:
+                    holiday = HolidayModel(user_id=user.id, date=h_date, reason=reason)
+                    db.add(holiday)
+                    db.commit()
+                    reason_str = f"\n_Reason: {reason}_" if reason else ""
+                    await u.message.reply_text(
+                        f"✅ *{h_date.strftime('%B %d, %Y')}* added as a day off!{reason_str}\n\n"
+                        f"I won't send work reminders on this date. 💫",
+                        parse_mode="Markdown",
+                        reply_markup=kb_holiday_menu(),
+                    )
+                except IntegrityError:
+                    db.rollback()
+                    await u.message.reply_text(
+                        f"🗓 *{h_date.strftime('%B %d, %Y')}* is already in your days-off list.",
+                        parse_mode="Markdown",
+                    )
+            return
+
+        # ── Awaiting edit value ──
+        edit_action = ctx.user_data.pop("edit_action", None)
+        if edit_action:
+            today = _now_local(tz).date()
+            sess  = get_active_session(db, user.id, today)
+            if not sess:
+                await u.message.reply_text("👀 No session to edit.", reply_markup=kb_idle())
+                return
+
+            if edit_action in ("start", "end"):
+                try:
+                    h, m = map(int, text.strip().split(":"))
+                    new_time = time(h, m)
+                    new_dt   = datetime.combine(today, new_time, tzinfo=tz)
+                    new_utc  = _to_utc(new_dt)
+                    if edit_action == "start":
+                        sess.started_at = new_utc
+                        db.commit()
+                        await u.message.reply_text(
+                            f"✅ *Start time updated to {fmt_t(new_dt)}!*\n\nAll times have been recalculated automatically. 💫",
+                            parse_mode="Markdown",
+                            reply_markup=kb_for_session(sess),
+                        )
+                    else:
+                        sess.ended_at = new_utc
+                        if sess.status != "done":
+                            sess.status = "done"
+                        db.commit()
+                        await u.message.reply_text(
+                            f"✅ *End time updated to {fmt_t(new_dt)}!*\n\nSession summary recalculated.",
+                            parse_mode="Markdown",
+                            reply_markup=kb_done(),
+                        )
+                except (ValueError, AttributeError):
+                    await u.message.reply_text(
+                        "❌ *I couldn’t parse that time.*\n\nPlease use *HH:MM* format, e.g. `09:20` or `17:45`.",
+                        parse_mode="Markdown",
+                    )
+            elif edit_action == "add_break":
+                try:
+                    parts = text.strip().split("-")
+                    sh, sm = map(int, parts[0].strip().split(":"))
+                    eh, em = map(int, parts[1].strip().split(":"))
+                    b_start = _to_utc(datetime.combine(today, time(sh, sm), tzinfo=tz))
+                    b_end   = _to_utc(datetime.combine(today, time(eh, em), tzinfo=tz))
+                    brk = Break(
+                        session_id=sess.id,
+                        started_at=b_start,
+                        ended_at=b_end,
+                        break_type="manual",
+                    )
+                    db.add(brk)
+                    db.commit()
+                    await u.message.reply_text(
+                        f"✅ *Break added!*  {time(sh, sm).strftime('%H:%M')}–{time(eh, em).strftime('%H:%M')}\n"
+                        f"Duration: *{fmt_dur((time(eh, em).hour*60+time(eh, em).minute - time(sh, sm).hour*60-time(sh, sm).minute)*60)}*\n\nYour working time has been recalculated. 💫",
+                        parse_mode="Markdown",
+                        reply_markup=kb_for_session(sess),
+                    )
+                except (ValueError, IndexError):
+                    await u.message.reply_text(
+                        "❌ *Couldn’t parse that.*\n\nUse *HH:MM-HH:MM* format, e.g. `12:00-12:30`.",
+                        parse_mode="Markdown",
+                    )
+            return
+
+        # ── Default text response ──
+        today = _now_local(tz).date()
+        sess  = get_active_session(db, user.id, today)
+        if sess and sess.status not in ("done", None):
+            await u.message.reply_text(
+                "👇 *Use the buttons below* to manage your session!",
+                parse_mode="Markdown",
+                reply_markup=kb_for_session(sess),
+            )
+        else:
+            await u.message.reply_text(
+                "👋 *Hey!* Tap *▶️ Start Working* to begin tracking your day!",
+                parse_mode="Markdown",
+                reply_markup=kb_idle(),
+            )
+    finally:
+        db.close()
+
+
+# ── App startup ────────────────────────────────────────────────
+
 async def post_init(app: Application):
-    active_count = 0
-    for uid, sess in sessions.items():
-        if sess.get("status") in ("working", "paused") and sess.get("chat_id"):
-            start_job(app, uid, sess["chat_id"])
-            active_count += 1
-    if active_count:
-        logger.info("Restored tracking jobs for %d active user session(s)", active_count)
+    await restore_scheduler_jobs(app)
+    logger.info("WorkBot started successfully.")
+
 
 # ── Main ──────────────────────────────────────────────────────
+
 def main():
-    if not TOKEN:
-        print("❌  BOT_TOKEN not set in .env"); return
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN not set in .env")
+        return
 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    # Initialize DB
+    init_db()
 
+    # Run migration if needed
+    run_migration()
+
+    # Build application
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # ── Conversation handlers ──
     goal_conv = ConversationHandler(
         entry_points=[CommandHandler("setgoal", cmd_setgoal)],
-        states={ASK_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_received)]},
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        states={ASK_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _goal_received)]},
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
     )
 
+    # ── Command handlers ──
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("begin",   cmd_begin))
+    app.add_handler(CommandHandler("start_work", cmd_begin))
     app.add_handler(CommandHandler("pause",   cmd_pause))
     app.add_handler(CommandHandler("resume",  cmd_resume))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("done",    cmd_done))
+    app.add_handler(CommandHandler("stop",    cmd_done))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("report",  cmd_report))
+    app.add_handler(CommandHandler("export",  cmd_export))
+    app.add_handler(CommandHandler("holiday", cmd_holiday))
+    app.add_handler(CommandHandler("edit",    cmd_edit))
     app.add_handler(goal_conv)
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    print("🤖  WorkBot is running! Press Ctrl+C to stop.")
+    print("🤖 WorkBot is running! Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
