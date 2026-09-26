@@ -153,12 +153,6 @@ def run_migration():
     print(f"✅ Migration complete: {migrated_users} user(s), {migrated_sessions} session(s) imported.")
 
 
-if __name__ == "__main__":
-    init_db()
-    run_migration()
-    dedup_sessions()
-
-
 def dedup_sessions():
     """
     Remove duplicate WorkSession rows that share the same (user_id, date, started_at).
@@ -182,9 +176,9 @@ def dedup_sessions():
         """))
         deleted = result.rowcount
         if deleted:
-            print(f"🧹 Removed {deleted} duplicate session row(s) from the database.")
+            print(f"\U0001f9f9 Removed {deleted} duplicate session row(s) from the database.")
         else:
-            print("✅ No duplicate sessions found.")
+            print("\u2705 No duplicate sessions found.")
 
         # ── Step 2: Create the unique index if it doesn't exist ───────────────
         existing = conn.execute(_text("""
@@ -197,9 +191,14 @@ def dedup_sessions():
                 CREATE UNIQUE INDEX uq_session_user_date_start
                 ON work_sessions (user_id, date, started_at)
             """))
-            print("✅ Unique index on (user_id, date, started_at) created.")
+            print("\u2705 Unique index on (user_id, date, started_at) created.")
         else:
-            print("✅ Unique index already exists.")
+            print("\u2705 Unique index already exists.")
 
         conn.commit()
 
+
+if __name__ == "__main__":
+    init_db()
+    run_migration()
+    dedup_sessions()
