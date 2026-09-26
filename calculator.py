@@ -91,7 +91,25 @@ def calculate(
     if tz is None:
         tz = ZoneInfo("Asia/Tashkent")
 
-    now = as_of or datetime.now(tz=session_started_at.tzinfo or tz)
+    # Normalise everything to the user's local timezone so that
+    # scheduled_break_start / scheduled_break_end (local clock times like
+    # time(13, 0)) align correctly with all work-segment arithmetic.
+    def _to_local(dt: datetime) -> datetime:
+        return dt.astimezone(tz)
+
+    session_started_at = _to_local(session_started_at)
+    if session_ended_at is not None:
+        session_ended_at = _to_local(session_ended_at)
+    breaks = [
+        BreakPeriod(
+            started_at=_to_local(bp.started_at),
+            ended_at=_to_local(bp.ended_at) if bp.ended_at is not None else None,
+            break_type=bp.break_type,
+        )
+        for bp in breaks
+    ]
+
+    now = as_of or datetime.now(tz=tz)
     session_end = session_ended_at or now
 
     # Clamp to actual session boundaries
