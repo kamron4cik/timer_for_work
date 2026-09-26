@@ -100,6 +100,7 @@ def _empty_row(d: date, sched: Optional[WorkSchedule], tz: ZoneInfo, status: str
 
 def _session_row(sess: WorkSession, sched: Optional[WorkSchedule], tz: ZoneInfo) -> dict:
     from datetime import time as dtime
+    from zoneinfo import ZoneInfo as _ZI
     from config import DEFAULT_LUNCH_START, DEFAULT_LUNCH_END
 
     lunch_s_h, lunch_s_m = map(int, DEFAULT_LUNCH_START.split(":"))
@@ -109,18 +110,26 @@ def _session_row(sess: WorkSession, sched: Optional[WorkSchedule], tz: ZoneInfo)
 
     required_hours = (sched.required_hours if sched and sched.required_hours else 8.0)
 
+    UTC = _ZI("UTC")
+
+    def _tag_utc(dt):
+        """Attach UTC tzinfo to a naive datetime from the database."""
+        if dt is None:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
     break_periods = [
         BreakPeriod(
-            started_at=b.started_at,
-            ended_at=b.ended_at,
+            started_at=_tag_utc(b.started_at),
+            ended_at=_tag_utc(b.ended_at),
             break_type=b.break_type,
         )
         for b in sess.breaks
     ]
 
     result = calculate(
-        session_started_at=sess.started_at,
-        session_ended_at=sess.ended_at,
+        session_started_at=_tag_utc(sess.started_at),
+        session_ended_at=_tag_utc(sess.ended_at),
         breaks=break_periods,
         required_hours=required_hours,
         scheduled_break_start=sched_lunch_start,

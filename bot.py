@@ -943,18 +943,20 @@ async def _send_export(bot, chat_id: int, uid: int, fmt: str, period: str):
         if fmt == "csv":
             data = export_csv(db, user, start, end)
             filename = f"WorkBot_{filename_period}_{today}.csv"
+            import io as _io
             await bot.send_document(
                 chat_id=chat_id,
-                document=InputFile(data, filename=filename),
+                document=InputFile(_io.BytesIO(data), filename=filename),
                 caption=f"📄 Work history – {filename_period}\n_{start} → {end}_",
                 parse_mode="Markdown",
             )
         else:
             data = export_excel(db, user, start, end)
             filename = f"WorkBot_{filename_period}_{today}.xlsx"
+            import io as _io
             await bot.send_document(
                 chat_id=chat_id,
-                document=InputFile(data, filename=filename),
+                document=InputFile(_io.BytesIO(data), filename=filename),
                 caption=f"📊 Work history – {filename_period}\n_{start} → {end}_",
                 parse_mode="Markdown",
             )
