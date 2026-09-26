@@ -138,8 +138,8 @@ def _session_row(sess: WorkSession, sched: Optional[WorkSchedule], tz: ZoneInfo)
     )
 
     overtime = max(0.0, result.worked_secs - result.required_secs)
-    actual_start = sess.started_at.astimezone(tz).strftime("%H:%M")
-    actual_end   = sess.ended_at.astimezone(tz).strftime("%H:%M") if sess.ended_at else "—"
+    actual_start = _tag_utc(sess.started_at).astimezone(tz).strftime("%H:%M") if sess.started_at else "—"
+    actual_end   = _tag_utc(sess.ended_at).astimezone(tz).strftime("%H:%M") if sess.ended_at else "—"
     sched_start  = sched.start_time.strftime("%H:%M") if sched and sched.start_time else "—"
     sched_end    = sched.end_time.strftime("%H:%M")   if sched and sched.end_time   else "—"
 
