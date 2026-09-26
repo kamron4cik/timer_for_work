@@ -164,8 +164,18 @@ def dedup_sessions():
     from db import engine
 
     with engine.connect() as conn:
-        # ── Step 1: Delete exact duplicates ───────────────────────────────────
-        # For each group of (user_id, date, started_at), keep only max(id).
+        # ── Step 1: Delete breaks belonging to duplicate sessions ─────────────
+        # First find which session ids will be deleted (all except MAX(id) per group)
+        conn.execute(_text("""
+            DELETE FROM breaks
+            WHERE session_id NOT IN (
+                SELECT MAX(id)
+                FROM work_sessions
+                GROUP BY user_id, date, started_at
+            )
+        """))
+
+        # ── Step 2: Delete the duplicate session rows ──────────────────────────
         result = conn.execute(_text("""
             DELETE FROM work_sessions
             WHERE id NOT IN (
@@ -180,7 +190,7 @@ def dedup_sessions():
         else:
             print("\u2705 No duplicate sessions found.")
 
-        # ── Step 2: Create the unique index if it doesn't exist ───────────────
+        # ── Step 3: Create the unique index if it doesn't exist ───────────────
         existing = conn.execute(_text("""
             SELECT name FROM sqlite_master
             WHERE type='index' AND name='uq_session_user_date_start'
@@ -196,6 +206,7 @@ def dedup_sessions():
             print("\u2705 Unique index already exists.")
 
         conn.commit()
+
 
 
 if __name__ == "__main__":
