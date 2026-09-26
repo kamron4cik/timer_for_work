@@ -96,7 +96,10 @@ class BreakSchedule(Base):
 
 class WorkSession(Base):
     __tablename__ = "work_sessions"
-    __table_args__ = (Index("ix_work_sessions_user_date", "user_id", "date"),)
+    __table_args__ = (
+        Index("ix_work_sessions_user_date", "user_id", "date"),
+        UniqueConstraint("user_id", "date", "started_at", name="uq_session_user_date_start"),
+    )
 
     id:           Mapped[int]            = mapped_column(Integer, primary_key=True)
     user_id:      Mapped[int]            = mapped_column(Integer, ForeignKey("users.id"), nullable=False)

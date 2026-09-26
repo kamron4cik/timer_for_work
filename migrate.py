@@ -156,4 +156,50 @@ def run_migration():
 if __name__ == "__main__":
     init_db()
     run_migration()
+    dedup_sessions()
+
+
+def dedup_sessions():
+    """
+    Remove duplicate WorkSession rows that share the same (user_id, date, started_at).
+    Keeps the row with the highest id (most recently inserted / most complete).
+    Also creates the unique index on the live DB if it doesn't exist yet.
+    Safe to run multiple times.
+    """
+    from sqlalchemy import text as _text
+    from db import engine
+
+    with engine.connect() as conn:
+        # ── Step 1: Delete exact duplicates ───────────────────────────────────
+        # For each group of (user_id, date, started_at), keep only max(id).
+        result = conn.execute(_text("""
+            DELETE FROM work_sessions
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM work_sessions
+                GROUP BY user_id, date, started_at
+            )
+        """))
+        deleted = result.rowcount
+        if deleted:
+            print(f"🧹 Removed {deleted} duplicate session row(s) from the database.")
+        else:
+            print("✅ No duplicate sessions found.")
+
+        # ── Step 2: Create the unique index if it doesn't exist ───────────────
+        existing = conn.execute(_text("""
+            SELECT name FROM sqlite_master
+            WHERE type='index' AND name='uq_session_user_date_start'
+        """)).fetchone()
+
+        if not existing:
+            conn.execute(_text("""
+                CREATE UNIQUE INDEX uq_session_user_date_start
+                ON work_sessions (user_id, date, started_at)
+            """))
+            print("✅ Unique index on (user_id, date, started_at) created.")
+        else:
+            print("✅ Unique index already exists.")
+
+        conn.commit()
 

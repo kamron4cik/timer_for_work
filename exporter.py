@@ -50,11 +50,36 @@ def _build_rows(
     tz = ZoneInfo(user.timezone)
     sessions = get_sessions_for_range(db, user.id, start, end)
 
-    # Group sessions by date (there can theoretically be multiple per day)
+    # Group sessions by date
     from collections import defaultdict
     by_date: dict[date, list[WorkSession]] = defaultdict(list)
     for sess in sessions:
         by_date[sess.date].append(sess)
+
+    def _best_session(sess_list: list[WorkSession]) -> WorkSession:
+        """
+        From potentially duplicate sessions on the same day, pick the one that
+        represents real work: prefer sessions with an ended_at, then the one
+        started latest, then the one with the highest id (most recently inserted).
+        """
+        # Deduplicate by started_at — keep only one per unique start time
+        seen_starts: set = set()
+        unique: list[WorkSession] = []
+        for s in sorted(sess_list, key=lambda x: x.id):
+            key = s.started_at
+            if key not in seen_starts:
+                seen_starts.add(key)
+                unique.append(s)
+
+        if len(unique) == 1:
+            return unique[0]
+
+        # Prefer sessions that have ended (real completed days)
+        ended = [s for s in unique if s.ended_at is not None]
+        pool = ended if ended else unique
+
+        # Among those, pick the one with the latest start (most likely the real session)
+        return max(pool, key=lambda s: (s.started_at, s.id))
 
     rows = []
     d = start
@@ -67,8 +92,8 @@ def _build_rows(
             if sched and sched.is_working_day:
                 rows.append(_empty_row(d, sched, tz, status="No Session"))
         else:
-            for sess in day_sessions:
-                rows.append(_session_row(sess, sched, tz))
+            best = _best_session(day_sessions)
+            rows.append(_session_row(best, sched, tz))
 
         from datetime import timedelta
         d = d + timedelta(days=1)

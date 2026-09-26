@@ -46,7 +46,7 @@ from scheduler import (
     cancel_done_job, schedule_done_job, restore_scheduler_jobs,
     _calc_session, _reschedule_done_job_for,
 )
-from migrate import run_migration
+from migrate import run_migration, dedup_sessions
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1462,6 +1462,7 @@ def main():
 
     # Run migration if needed
     run_migration()
+    dedup_sessions()
 
     # Build application
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
