@@ -299,38 +299,35 @@ def _status_card(sess: WorkSession, result: CalcResult, tz: ZoneInfo, sched: Opt
 
 # ── Timeline text ──────────────────────────────────────────────
 
-def _timeline_text(sess: WorkSession, tz: ZoneInfo) -> str:
-    if not sess.breaks:
+def _timeline_text(sess: WorkSession, result: CalcResult, tz: ZoneInfo) -> str:
+    """
+    Render the timeline using the *same* canonical intervals that produced
+    all other metrics in ``result``.  This guarantees timeline ↔ worked ↔
+    remaining ↔ progress are always consistent.
+    """
+    from calculator import IntervalType
+
+    if not result.intervals:
         started_local = _to_tz(sess.started_at, tz)
         ended_local   = _to_tz(sess.ended_at, tz) if sess.ended_at else None
         end_str = fmt_t(ended_local) if ended_local else "now ←"
         return f"*📅 Timeline*\n\n💼  {fmt_t(started_local)} → {end_str}"
 
+    is_open = sess.ended_at is None
     lines = ["*📅 Timeline*", ""]
-    # Build segments from breaks
-    breaks_sorted = sorted(sess.breaks, key=lambda b: b.started_at)
-    cursor = _to_tz(sess.started_at, tz)
 
-    for brk in breaks_sorted:
-        b_start = _to_tz(brk.started_at, tz)
-        b_end   = _to_tz(brk.ended_at, tz) if brk.ended_at else None
-        if b_start > cursor:
-            dur = (b_start - cursor).total_seconds()
-            lines.append(f"💼  {fmt_t(cursor)} → {fmt_t(b_start)}  _({fmt_dur(dur)})_")
-        icon = "🍱" if brk.break_type == "lunch" else "☕"
-        end_str = fmt_t(b_end) if b_end else "now ←"
-        if b_end:
-            dur = (b_end - b_start).total_seconds()
-            lines.append(f"{icon}  {fmt_t(b_start)} → {end_str}  _({fmt_dur(dur)})_")
-        else:
-            lines.append(f"{icon}  {fmt_t(b_start)} → now ← (ongoing)")
-        cursor = b_end or _now_local(tz)
+    for iv in result.intervals:
+        start_str = fmt_t(iv.start)
+        is_last   = (iv is result.intervals[-1])
+        end_str   = ("now ←" if is_open and is_last else fmt_t(iv.end))
+        dur_str   = fmt_dur(iv.duration_secs)
 
-    session_end = _to_tz(sess.ended_at, tz) if sess.ended_at else None
-    if cursor < (session_end or _now_local(tz)):
-        end_str = fmt_t(session_end) if session_end else "now ←"
-        dur = ((session_end or _now_local(tz)) - cursor).total_seconds()
-        lines.append(f"💼  {fmt_t(cursor)} → {end_str}  _({fmt_dur(dur)})_")
+        if iv.interval_type == IntervalType.WORK:
+            lines.append(f"💼  {start_str} → {end_str}  _({dur_str})_")
+        elif iv.interval_type == IntervalType.LUNCH:
+            lines.append(f"🍱  {start_str} → {end_str}  _({dur_str})_")
+        else:  # OTHER_BREAK
+            lines.append(f"☕  {start_str} → {end_str}  _({dur_str})_")
 
     return "\n".join(lines)
 
@@ -623,7 +620,7 @@ async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sched  = get_schedule_for_weekday(db, user.id, today.weekday())
         result = _get_session_result(db, sess, sched, tz)
         card   = _status_card(sess, result, tz, sched)
-        tl     = _timeline_text(sess, tz)
+        tl     = _timeline_text(sess, result, tz)
         await u.message.reply_text(
             card + "\n\n" + tl,
             parse_mode="Markdown",
@@ -663,7 +660,7 @@ async def cmd_done(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sched  = get_schedule_for_weekday(db, user.id, today.weekday())
         result = _get_session_result(db, sess, sched, tz)
         card   = _status_card(sess, result, tz, sched)
-        tl     = _timeline_text(sess, tz)
+        tl     = _timeline_text(sess, result, tz)
 
         if result.is_complete:
             overtime = result.worked_secs - result.required_secs
@@ -1092,7 +1089,7 @@ async def on_button(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sched  = get_schedule_for_weekday(db, user.id, today.weekday())
             result = _get_session_result(db, sess, sched, tz)
             card   = _status_card(sess, result, tz, sched)
-            tl     = _timeline_text(sess, tz)
+            tl     = _timeline_text(sess, result, tz)
             await say(card + "\n\n" + tl)
 
         # ── Done ──
@@ -1110,7 +1107,7 @@ async def on_button(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sched  = get_schedule_for_weekday(db, user.id, today.weekday())
             result = _get_session_result(db, sess, sched, tz)
             card   = _status_card(sess, result, tz, sched)
-            tl     = _timeline_text(sess, tz)
+            tl     = _timeline_text(sess, result, tz)
             if result.is_complete:
                 overtime = result.worked_secs - result.required_secs
                 ot_str = f"\n🌟 Overtime: *{fmt_dur(overtime)}* — above and beyond!" if overtime > 60 else ""
