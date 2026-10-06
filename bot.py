@@ -212,6 +212,9 @@ def _to_utc(dt: datetime) -> datetime:
 
 
 def _to_tz(dt: datetime, tz: ZoneInfo) -> datetime:
+    # DB stores naive UTC; without tagging, astimezone() would assume server-local time
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
     return dt.astimezone(tz)
 
 

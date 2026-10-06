@@ -341,7 +341,7 @@ async def _goal_reached_job(ctx: ContextTypes.DEFAULT_TYPE):
 
         mark_notification_sent(db, user_id, "goal_reached", today)
 
-        started_local = sess.started_at.astimezone(tz)
+        started_local = sess.started_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
         now_local = datetime.now(tz=tz)
 
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
